@@ -28,6 +28,19 @@ def validate_run_id(run_id: str) -> None:
         raise InstrumentationError("run_id contains unsupported characters")
 
 
+def instrumentation_enabled(output_dir: str | None, run_id: str | None) -> bool:
+    """Return whether the paired opt-in settings enable evidence output."""
+
+    if bool(output_dir) != bool(run_id):
+        raise InstrumentationError(
+            "moe_instrumentation_dir and moe_instrumentation_run_id must be supplied together"
+        )
+    if not output_dir:
+        return False
+    validate_run_id(run_id)
+    return True
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 

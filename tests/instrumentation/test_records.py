@@ -12,6 +12,7 @@ from freetoken.instrumentation.records import (
     InstrumentationError,
     MoeEventWriter,
     aggregate_records,
+    instrumentation_enabled,
     load_event_file,
     validate_forward_record,
     validate_run_id,
@@ -208,6 +209,16 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
         encoding="utf-8",
     )
+
+
+def test_instrumentation_is_disabled_without_opt_in(tmp_path: Path) -> None:
+    assert instrumentation_enabled(None, None) is False
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_instrumentation_requires_paired_opt_in_settings() -> None:
+    with pytest.raises(InstrumentationError, match="must be supplied together"):
+        instrumentation_enabled("evidence", None)
 
 
 def test_valid_trace_reconciles_and_aggregates(tmp_path: Path) -> None:

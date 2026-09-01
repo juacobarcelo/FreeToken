@@ -333,8 +333,13 @@ class Engine:
         self.cpu_moe_executor = None
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
+        from freetoken.instrumentation import instrumentation_enabled
+
         self.moe_instrumentation = None
-        if config.moe_instrumentation_dir is not None:
+        if instrumentation_enabled(
+            config.moe_instrumentation_dir,
+            config.moe_instrumentation_run_id,
+        ):
             from freetoken.instrumentation.recorder import MoeInstrumentationRecorder
 
             self.moe_instrumentation = MoeInstrumentationRecorder(config, self.device)
@@ -1118,20 +1123,17 @@ def _adjust_config(config: EngineConfig):
     expert_quant = getattr(model_config, "expert_quant", "none")
     instrumentation_dir = getattr(config, "moe_instrumentation_dir", None)
     instrumentation_run_id = getattr(config, "moe_instrumentation_run_id", None)
-    if bool(instrumentation_dir) != bool(instrumentation_run_id):
-        raise ValueError(
-            "moe_instrumentation_dir and moe_instrumentation_run_id must be supplied together"
-        )
-    instrumentation_enabled = bool(instrumentation_dir)
-    if instrumentation_enabled:
+    from freetoken.instrumentation import instrumentation_enabled
+
+    instrumentation_is_enabled = instrumentation_enabled(
+        instrumentation_dir,
+        instrumentation_run_id,
+    )
+    if instrumentation_is_enabled:
         if not is_moe:
             raise ValueError("MoE instrumentation requires a model with routed experts")
         if getattr(model_config, "model_type", None) != "gpt_oss":
             raise ValueError("MoE instrumentation schema 1.0 currently supports gpt_oss only")
-        from freetoken.instrumentation import validate_run_id
-
-        validate_run_id(instrumentation_run_id)
-
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
         # is worse than inert -- engine init would build an expert cache for a model that has
@@ -1326,7 +1328,7 @@ def _adjust_config(config: EngineConfig):
                 f"auto-selected backend {config.moe_backend!r}"
             )
 
-    if instrumentation_enabled:
+    if instrumentation_is_enabled:
         if config.moe_backend not in {"fused", "offload"}:
             raise ValueError(
                 "MoE instrumentation schema 1.0 supports resolved fused and offload "

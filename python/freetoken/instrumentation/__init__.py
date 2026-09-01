@@ -12,6 +12,7 @@ from .records import (
     MoeEventWriter,
     aggregate_event_file,
     aggregate_records,
+    instrumentation_enabled,
     load_event_file,
     validate_run_id,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "MoeEventWriter",
     "aggregate_event_file",
     "aggregate_records",
+    "instrumentation_enabled",
     "load_event_file",
     "validate_run_id",
 ]
