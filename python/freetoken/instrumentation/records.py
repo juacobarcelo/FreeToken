@@ -164,10 +164,22 @@ def validate_run_record(record: Mapping[str, Any]) -> None:
             cache.get("initial_resident_objects"),
             "run.expert_cache.initial_resident_objects",
         )
-        if initial:
-            raise InstrumentationError(
-                "run.expert_cache.initial_resident_objects: FreeToken starts with an empty cache"
-            )
+        initial_slots: set[int] = set()
+        initial_objects: set[tuple[int, int]] = set()
+        for index, raw_object in enumerate(initial):
+            path = f"run.expert_cache.initial_resident_objects[{index}]"
+            item = _require_mapping(raw_object, path)
+            layer_id = _require_int(item.get("layer_id"), f"{path}.layer_id")
+            expert_id = _require_int(item.get("expert_id"), f"{path}.expert_id")
+            slot_id = _require_int(item.get("slot_id"), f"{path}.slot_id")
+            if layer_id >= model["num_moe_layers"] or expert_id >= model["num_experts"]:
+                raise InstrumentationError(f"{path}: expert object is out of range")
+            if slot_id >= cache["capacity_objects"]:
+                raise InstrumentationError(f"{path}.slot_id: out of range")
+            if slot_id in initial_slots or (layer_id, expert_id) in initial_objects:
+                raise InstrumentationError(f"{path}: duplicate slot or expert object")
+            initial_slots.add(slot_id)
+            initial_objects.add((layer_id, expert_id))
         if cache.get("initial_state_boundary") != "before_first_observed_forward":
             raise InstrumentationError(
                 "run.expert_cache.initial_state_boundary: unsupported boundary"
@@ -554,6 +566,58 @@ def validate_run_end_record(record: Mapping[str, Any], run: Mapping[str, Any]) -
         raise InstrumentationError("run_end.status: must be complete")
 
 
+def _validate_cache_replay(records: Sequence[Mapping[str, Any]]) -> None:
+    """Reconstruct persistent slots independently from reported transitions."""
+
+    run = records[0]
+    if run["execution_mode"] == "fused":
+        return
+    state = {
+        item["slot_id"]: (item["layer_id"], item["expert_id"])
+        for item in run["expert_cache"]["initial_resident_objects"]
+    }
+    for record in records:
+        if record.get("record_type") != "forward":
+            continue
+        for layer in record["layers"]:
+            layer_id = layer["layer_id"]
+            requested = {
+                (layer_id, expert_id)
+                for row in layer["requested_expert_ids"]
+                for expert_id in row
+            }
+            if layer["residency"]["availability"] == "measured":
+                resident = set(state.values())
+                hits = len(requested & resident)
+                if layer["residency"]["hit_count"] != hits:
+                    raise InstrumentationError(
+                        f"cache replay: layer {layer_id} residency hits differ from state"
+                    )
+                if layer["residency"]["miss_count"] != len(requested) - hits:
+                    raise InstrumentationError(
+                        f"cache replay: layer {layer_id} residency misses differ from state"
+                    )
+            for eviction in layer["evictions"]:
+                slot_id = eviction["slot_id"]
+                expected = (eviction["layer_id"], eviction["expert_id"])
+                if state.get(slot_id) != expected:
+                    raise InstrumentationError(
+                        f"cache replay: slot {slot_id} does not contain evicted object {expected}"
+                    )
+                del state[slot_id]
+            loaded_slots: set[int] = set()
+            for load in layer["loads"]:
+                if load["destination"] != "device_cache":
+                    continue
+                slot_id = load["slot_id"]
+                if slot_id in loaded_slots or slot_id in state:
+                    raise InstrumentationError(
+                        f"cache replay: load destination slot {slot_id} was not empty"
+                    )
+                loaded_slots.add(slot_id)
+                state[slot_id] = (load["layer_id"], load["expert_id"])
+
+
 def load_event_file(path: Path) -> list[dict[str, Any]]:
     """Load and validate one JSONL stream, including ordering and clock monotonicity."""
 
@@ -609,6 +673,7 @@ def load_event_file(path: Path) -> list[dict[str, Any]]:
             saw_end = True
         else:
             raise InstrumentationError(f"{path}: unsupported record_type {record_type!r}")
+    _validate_cache_replay(records)
     return records
 
 

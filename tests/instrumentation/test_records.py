@@ -37,7 +37,10 @@ def _run(*, mode: str = "offload") -> dict:
             "capacity_objects": 2,
             "policy": "lru",
             "expert_object_bytes": 10,
-            "initial_resident_objects": [],
+            "initial_resident_objects": [
+                {"layer_id": 0, "expert_id": 3, "slot_id": 0},
+                {"layer_id": 0, "expert_id": 1, "slot_id": 1},
+            ],
             "initial_state_boundary": "before_first_observed_forward",
             "reason": None,
         }
@@ -126,7 +129,10 @@ def _offload_forward() -> dict:
                         "destination": "device_cache",
                     },
                 ],
-                "evictions": [{"layer_id": 0, "expert_id": 3, "slot_id": 0}],
+                "evictions": [
+                    {"layer_id": 0, "expert_id": 3, "slot_id": 0},
+                    {"layer_id": 0, "expert_id": 1, "slot_id": 1},
+                ],
                 "residency_transitions": [
                     {
                         "layer_id": 0,
@@ -143,6 +149,14 @@ def _offload_forward() -> dict:
                         "from": "host_source",
                         "to": "device_cache",
                         "cause": "load",
+                    },
+                    {
+                        "layer_id": 0,
+                        "expert_id": 1,
+                        "slot_id": 1,
+                        "from": "device_cache",
+                        "to": "host_source",
+                        "cause": "eviction",
                     },
                     {
                         "layer_id": 0,
@@ -212,7 +226,7 @@ def test_valid_trace_reconciles_and_aggregates(tmp_path: Path) -> None:
     assert totals["residency_hits"]["value"] == 1
     assert totals["residency_misses"]["value"] == 2
     assert totals["expert_loads"]["value"] == 2
-    assert totals["expert_evictions"]["value"] == 1
+    assert totals["expert_evictions"]["value"] == 2
     assert totals["h2d_transfer_bytes"]["value"] == 20
     assert totals["d2h_transfer_bytes"]["availability"] == "not_applicable"
 
@@ -224,6 +238,16 @@ def test_rejects_non_monotonic_trace(tmp_path: Path) -> None:
     _write_jsonl(path, [_run(), forward])
 
     with pytest.raises(InstrumentationError, match="not monotonic"):
+        load_event_file(path)
+
+
+def test_rejects_cache_movement_that_cannot_replay(tmp_path: Path) -> None:
+    run = _run()
+    run["expert_cache"]["initial_resident_objects"][0]["expert_id"] = 0
+    path = tmp_path / "bad-cache.events.jsonl"
+    _write_jsonl(path, [run, _offload_forward()])
+
+    with pytest.raises(InstrumentationError, match="cache replay"):
         load_event_file(path)
 
 

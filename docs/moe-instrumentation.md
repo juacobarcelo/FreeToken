@@ -70,9 +70,11 @@ eviction discards a device copy and D2H expert transfer is `not_applicable`.
 Fused execution has no expert cache, so cache residency and expert transfers are
 also `not_applicable`, not zero.
 
-Offload runs declare an empty `initial_resident_objects` set at the
-`before_first_observed_forward` boundary. Ordered layer transitions can therefore
-reconstruct the cache state without assuming an unreported warm state.
+The current offload recorder declares an empty `initial_resident_objects` set at
+the `before_first_observed_forward` boundary. The schema also represents an
+explicit non-empty starting set for fixture and future producers. Ordered layer
+transitions can therefore reconstruct the cache state without assuming an
+unreported warm state.
 
 ## Timing overhead
 

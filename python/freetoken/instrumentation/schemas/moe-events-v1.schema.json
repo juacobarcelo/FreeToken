@@ -30,7 +30,11 @@
         "expert_object_bytes": {"type": ["integer", "null"], "minimum": 1},
         "initial_resident_objects": {
           "oneOf": [
-            {"type": "array", "maxItems": 0},
+            {
+              "type": "array",
+              "items": {"$ref": "#/$defs/eviction"},
+              "uniqueItems": true
+            },
             {"type": "null"}
           ]
         },
@@ -48,7 +52,7 @@
               "capacity_objects": {"type": "integer"},
               "policy": {"type": "string"},
               "expert_object_bytes": {"type": "integer"},
-              "initial_resident_objects": {"type": "array", "maxItems": 0},
+              "initial_resident_objects": {"type": "array"},
               "initial_state_boundary": {"const": "before_first_observed_forward"},
               "reason": {"type": "null"}
             }
