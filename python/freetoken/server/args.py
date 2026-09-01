@@ -590,6 +590,23 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-instrumentation-dir",
+        type=str,
+        default=ServerArgs.moe_instrumentation_dir,
+        help=(
+            "Opt in to versioned MoE event and aggregate files in this directory. "
+            "Disabled by default and requires --moe-instrumentation-run-id."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-instrumentation-run-id",
+        type=str,
+        default=ServerArgs.moe_instrumentation_run_id,
+        help="Stable identifier used in the opt-in MoE evidence filenames.",
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
@@ -607,6 +624,14 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    if bool(kwargs["moe_instrumentation_dir"]) != bool(
+        kwargs["moe_instrumentation_run_id"]
+    ):
+        parser.error(
+            "--moe-instrumentation-dir and --moe-instrumentation-run-id "
+            "must be supplied together"
+        )
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

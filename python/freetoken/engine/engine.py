@@ -333,6 +333,14 @@ class Engine:
         self.cpu_moe_executor = None
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
+        self.moe_instrumentation = None
+        if config.moe_instrumentation_dir is not None:
+            from freetoken.instrumentation.recorder import MoeInstrumentationRecorder
+
+            self.moe_instrumentation = MoeInstrumentationRecorder(config, self.device)
+            if self.moe_offload_cache is not None:
+                self.moe_instrumentation.attach_cache(self.moe_offload_cache)
+            self.ctx.moe_instrumentation = self.moe_instrumentation
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
 
@@ -732,6 +740,11 @@ class Engine:
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
                 and num_swa_pages is None):
             return
+        if moe_cache_size is not None and self.moe_instrumentation is not None:
+            raise CacheRebuildRejected(
+                "moe_cache_size cannot change during an instrumented run; restart the "
+                "server with a new run id and the target cache size"
+            )
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
         #     slots on a model with no offload cache, moe below num_experts / above the
@@ -862,11 +875,15 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if self.moe_instrumentation is not None:
+            self.moe_instrumentation.begin_forward()
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
+        if self.moe_instrumentation is not None:
+            self.moe_instrumentation.finish_forward(batch)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -940,6 +957,8 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        if self.moe_instrumentation is not None:
+            self.moe_instrumentation.close()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
@@ -1097,6 +1116,21 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+    instrumentation_dir = getattr(config, "moe_instrumentation_dir", None)
+    instrumentation_run_id = getattr(config, "moe_instrumentation_run_id", None)
+    if bool(instrumentation_dir) != bool(instrumentation_run_id):
+        raise ValueError(
+            "moe_instrumentation_dir and moe_instrumentation_run_id must be supplied together"
+        )
+    instrumentation_enabled = bool(instrumentation_dir)
+    if instrumentation_enabled:
+        if not is_moe:
+            raise ValueError("MoE instrumentation requires a model with routed experts")
+        if getattr(model_config, "model_type", None) != "gpt_oss":
+            raise ValueError("MoE instrumentation schema 1.0 currently supports gpt_oss only")
+        from freetoken.instrumentation import validate_run_id
+
+        validate_run_id(instrumentation_run_id)
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
@@ -1290,6 +1324,19 @@ def _adjust_config(config: EngineConfig):
             logger.info_rank0(
                 "No MoE cache sizing flag given; defaulting to --moe-cache-auto for "
                 f"auto-selected backend {config.moe_backend!r}"
+            )
+
+    if instrumentation_enabled:
+        if config.moe_backend not in {"fused", "offload"}:
+            raise ValueError(
+                "MoE instrumentation schema 1.0 supports resolved fused and offload "
+                f"backends, got {config.moe_backend!r}"
+            )
+        if config.tp_info.size != 1:
+            raise ValueError("MoE instrumentation schema 1.0 supports tensor parallel size 1")
+        if config.moe_prefill_hit_d2d:
+            raise ValueError(
+                "MoE instrumentation schema 1.0 does not support moe_prefill_hit_d2d"
             )
 
     if is_moe and config.moe_backend == "fused":

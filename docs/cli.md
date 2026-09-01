@@ -71,6 +71,11 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+| `--moe-instrumentation-dir` | off | Write opt-in GPT-OSS MoE evidence; requires `--moe-instrumentation-run-id` |
+| `--moe-instrumentation-run-id` | off | Stable, filename-safe id for one evidence stream |
+
+See [MoE instrumentation](moe-instrumentation.md) for the supported paths,
+versioned schemas, metric definitions, and timing caveat.
 
 ### API behaviour
 
@@ -153,4 +158,3 @@ expert format + GPU name, so a profile from different hardware is ignored
 rather than misapplied. Selection flags: `--dtype`, `--model`, `--formats`,
 `--isa`; decision rule: `--threshold` (default 2.0 — recommend hybrid when CPU
 bandwidth > 2× PCIe).
-

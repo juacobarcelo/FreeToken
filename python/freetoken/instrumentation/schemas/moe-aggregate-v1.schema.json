@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juacobarcelo/FreeToken/schemas/moe-aggregate-v1.schema.json",
+  "title": "FreeToken MoE instrumentation aggregate schema 1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_type",
+    "event_schema_version",
+    "run_id",
+    "complete",
+    "forward_count",
+    "prefill_forward_count",
+    "decode_forward_count",
+    "totals",
+    "source"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "record_type": {"const": "aggregate"},
+    "event_schema_version": {"const": "1.0"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "complete": {"type": "boolean"},
+    "forward_count": {"type": "integer", "minimum": 0},
+    "prefill_forward_count": {"type": "integer", "minimum": 0},
+    "decode_forward_count": {"type": "integer", "minimum": 0},
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_expert_occurrences",
+        "unique_requested_expert_objects",
+        "residency_hits",
+        "residency_misses",
+        "expert_loads",
+        "expert_evictions",
+        "h2d_transfer_operations",
+        "h2d_transfer_objects",
+        "h2d_transfer_bytes",
+        "h2d_transfer_duration",
+        "d2h_transfer_bytes",
+        "expert_compute_duration"
+      ],
+      "properties": {
+        "requested_expert_occurrences": {"$ref": "#/$defs/metric"},
+        "unique_requested_expert_objects": {"$ref": "#/$defs/metric"},
+        "residency_hits": {"$ref": "#/$defs/metric"},
+        "residency_misses": {"$ref": "#/$defs/metric"},
+        "expert_loads": {"$ref": "#/$defs/metric"},
+        "expert_evictions": {"$ref": "#/$defs/metric"},
+        "h2d_transfer_operations": {"$ref": "#/$defs/metric"},
+        "h2d_transfer_objects": {"$ref": "#/$defs/metric"},
+        "h2d_transfer_bytes": {"$ref": "#/$defs/metric"},
+        "h2d_transfer_duration": {"$ref": "#/$defs/metric"},
+        "d2h_transfer_bytes": {"$ref": "#/$defs/metric"},
+        "expert_compute_duration": {"$ref": "#/$defs/metric"}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "events_file": {"type": "string", "minLength": 1},
+        "events_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "events_size_bytes": {"type": "integer", "minimum": 0}
+      }
+    }
+  },
+  "$defs": {
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "reason", "unit", "value"],
+      "properties": {
+        "availability": {
+          "enum": ["measured", "unavailable", "unsupported", "not_applicable"]
+        },
+        "reason": {"type": ["string", "null"], "minLength": 1},
+        "unit": {"type": "string", "minLength": 1},
+        "value": {"type": ["integer", "null"], "minimum": 0}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"availability": {"const": "measured"}}},
+          "then": {
+            "properties": {
+              "reason": {"type": "null"},
+              "value": {"type": "integer"}
+            }
+          },
+          "else": {
+            "properties": {
+              "reason": {"type": "string"},
+              "value": {"type": "null"}
+            }
+          }
+        }
+      ]
+    }
+  }
+}

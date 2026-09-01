@@ -260,6 +260,17 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
 
+    @staticmethod
+    def _instrumentation():
+        """Return the opt-in recorder without affecting ordinary cache users/tests."""
+
+        from freetoken.core import get_global_ctx
+
+        try:
+            return get_global_ctx().moe_instrumentation
+        except AssertionError:
+            return None
+
     def set_bank_sources(
         self,
         sources: dict[str, list[torch.Tensor]],
@@ -604,15 +615,28 @@ class OffloadMoeCache:
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
 
+        instrumentation = self._instrumentation()
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
+            if instrumentation is not None:
+                instrumentation.record_cache_before(layer_id)
+                instrumentation.begin_transfer(layer_id)
             copy()
+            if instrumentation is not None:
+                instrumentation.end_transfer(layer_id)
+                instrumentation.record_prefill_cache_after(layer_id, buffer_id)
         else:
             with torch.cuda.stream(self.prefill_copy_stream):
                 if self._prefill_buffer_has_release_event[buffer_id]:
                     self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+                if instrumentation is not None:
+                    instrumentation.record_cache_before(layer_id)
+                    instrumentation.begin_transfer(layer_id)
                 copy()
+                if instrumentation is not None:
+                    instrumentation.end_transfer(layer_id)
+                    instrumentation.record_prefill_cache_after(layer_id, buffer_id)
                 self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
         self._prefill_buffer_layer[buffer_id] = layer_id
@@ -761,6 +785,9 @@ class OffloadMoeCache:
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
+        instrumentation = self._instrumentation()
+        if instrumentation is not None:
+            instrumentation.record_cache_before(layer_id)
         if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
             # slot ids in place), so snapshot the routing histogram before that happens.
@@ -768,6 +795,8 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         ensure_experts(self, layer_id, expert_ids)
+        if instrumentation is not None:
+            instrumentation.record_cache_after(layer_id)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -792,8 +821,13 @@ class OffloadMoeCache:
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
 
+        instrumentation = self._instrumentation()
+        if instrumentation is not None:
+            instrumentation.record_cache_before(layer_id)
         self._pending_src_layer = layer_id
         materialize_layer(self, layer_id)
+        if instrumentation is not None:
+            instrumentation.record_cache_after(layer_id)
 
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
@@ -927,6 +961,9 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        instrumentation = self._instrumentation()
+        if instrumentation is not None:
+            instrumentation.begin_transfer(layer_id)
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
@@ -942,6 +979,8 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+            if instrumentation is not None:
+                instrumentation.end_transfer(layer_id)
             return
 
         from freetoken.kernel import fast_index_copy_jit
@@ -954,6 +993,8 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+        if instrumentation is not None:
+            instrumentation.end_transfer(layer_id)
 
 
 def iter_offload_moe_layers(model) -> Iterator:
