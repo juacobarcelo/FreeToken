@@ -146,6 +146,8 @@ def validate_run_record(record: Mapping[str, Any]) -> None:
     model = _require_mapping(record.get("model"), "run.model")
     for field in ("num_moe_layers", "num_experts", "experts_per_token"):
         _require_int(model.get(field), f"run.model.{field}", minimum=1)
+    if model["experts_per_token"] > model["num_experts"]:
+        raise InstrumentationError("run.model: experts_per_token exceeds num_experts")
     _require_string(model.get("id"), "run.model.id")
     cache = _validate_availability(record.get("expert_cache"), "run.expert_cache")
     if cache["availability"] == "measured":
@@ -187,6 +189,7 @@ def _validate_layer(
     execution_mode: str,
     phase: str,
     expert_object_bytes: int | None,
+    cache_capacity: int | None,
 ) -> None:
     layer = _require_mapping(value, path)
     if layer.get("layer_id") != expected_layer:
@@ -243,7 +246,7 @@ def _validate_layer(
         expert_id = _require_int(load.get("expert_id"), f"{path}.loads[{index}].expert_id")
         if expert_id >= num_experts:
             raise InstrumentationError(f"{path}.loads[{index}].expert_id: out of range")
-        _require_int(load.get("slot_id"), f"{path}.loads[{index}].slot_id")
+        slot_id = _require_int(load.get("slot_id"), f"{path}.loads[{index}].slot_id")
         _require_int(load.get("bytes"), f"{path}.loads[{index}].bytes", minimum=1)
         if load.get("destination") not in {"device_cache", "device_transient"}:
             raise InstrumentationError(f"{path}.loads[{index}].destination: unsupported")
@@ -255,12 +258,17 @@ def _validate_layer(
             raise InstrumentationError(
                 f"{path}.loads[{index}].bytes: does not match run cache geometry"
             )
+        if cache_capacity is None or slot_id >= cache_capacity:
+            raise InstrumentationError(f"{path}.loads[{index}].slot_id: out of range")
     load_keys = [
         (load["layer_id"], load["expert_id"], load["slot_id"], load["destination"])
         for load in loads
     ]
     if len(load_keys) != len(set(load_keys)):
         raise InstrumentationError(f"{path}.loads: duplicate load")
+    loaded_experts = [load["expert_id"] for load in loads]
+    if len(loaded_experts) != len(set(loaded_experts)):
+        raise InstrumentationError(f"{path}.loads: expert loaded more than once")
 
     evictions = _require_list(layer.get("evictions"), f"{path}.evictions")
     for index, raw in enumerate(evictions):
@@ -275,7 +283,11 @@ def _validate_layer(
         )
         if expert_id >= num_experts:
             raise InstrumentationError(f"{path}.evictions[{index}].expert_id: out of range")
-        _require_int(eviction.get("slot_id"), f"{path}.evictions[{index}].slot_id")
+        eviction_slot = _require_int(
+            eviction.get("slot_id"), f"{path}.evictions[{index}].slot_id"
+        )
+        if cache_capacity is None or eviction_slot >= cache_capacity:
+            raise InstrumentationError(f"{path}.evictions[{index}].slot_id: out of range")
 
     transitions = _require_list(
         layer.get("residency_transitions"), f"{path}.residency_transitions"
@@ -334,6 +346,8 @@ def _validate_layer(
         (eviction["layer_id"], eviction["expert_id"], eviction["slot_id"])
         for eviction in evictions
     ]
+    if len(eviction_keys) != len(set(eviction_keys)):
+        raise InstrumentationError(f"{path}.evictions: duplicate eviction")
     if sorted(load_transition_keys) != sorted(load_keys):
         raise InstrumentationError(f"{path}.residency_transitions: loads do not reconcile")
     if sorted(eviction_transition_keys) != sorted(eviction_keys):
@@ -364,8 +378,14 @@ def _validate_layer(
             raise InstrumentationError(f"{path}.residency: offload decode requires measured")
         if residency["miss_count"] != len(loads):
             raise InstrumentationError(f"{path}.loads: count must equal decode misses")
+        if not set(loaded_experts).issubset(
+            {expert for row in requested for expert in row}
+        ):
+            raise InstrumentationError(f"{path}.loads: decode loaded an unrequested expert")
     elif residency["availability"] != "not_applicable":
         raise InstrumentationError(f"{path}.residency: offload prefill requires not_applicable")
+    elif set(loaded_experts) != set(range(num_experts)):
+        raise InstrumentationError(f"{path}.loads: prefill must load the complete layer")
     _validate_compute(layer.get("compute"), f"{path}.compute")
 
 
@@ -434,6 +454,7 @@ def validate_forward_record(record: Mapping[str, Any], run: Mapping[str, Any]) -
             execution_mode=run["execution_mode"],
             phase=phase,
             expert_object_bytes=run["expert_cache"]["expert_object_bytes"],
+            cache_capacity=run["expert_cache"]["capacity_objects"],
         )
         if layer["requested_shape"][0] != token_rows:
             raise InstrumentationError(
