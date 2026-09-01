@@ -127,6 +127,8 @@ class MoeInstrumentationRecorder:
                     "capacity_objects": None,
                     "policy": None,
                     "expert_object_bytes": None,
+                    "initial_resident_objects": None,
+                    "initial_state_boundary": None,
                     "reason": _NO_CACHE_REASON,
                 },
             )
@@ -165,6 +167,8 @@ class MoeInstrumentationRecorder:
                 "capacity_objects": cache.cache_size,
                 "policy": cache.cache_policy,
                 "expert_object_bytes": self._expert_object_bytes,
+                "initial_resident_objects": [],
+                "initial_state_boundary": "before_first_observed_forward",
                 "reason": None,
             },
         )
@@ -239,6 +243,21 @@ class MoeInstrumentationRecorder:
         rows = batch.padded_size if batch.is_decode else int(batch.input_ids.numel())
         if rows > self.max_rows:
             raise RuntimeError(f"MoE instrumentation rows {rows} exceed {self.max_rows}")
+
+        request_sequence_ids = [req.uid for req in batch.reqs]
+        if batch.is_decode:
+            token_row_sequence_ids: list[int | None] = request_sequence_ids + [
+                None
+            ] * (batch.padded_size - batch.size)
+            token_positions: list[int | None] = [req.cached_len for req in batch.reqs] + [
+                None
+            ] * (batch.padded_size - batch.size)
+        else:
+            token_row_sequence_ids = []
+            token_positions = []
+            for req in batch.reqs:
+                token_row_sequence_ids.extend([req.uid] * req.extend_len)
+                token_positions.extend(range(req.cached_len, req.device_len))
 
         requested = self._requested[:, :rows].cpu().tolist()
         pre_ids = self._pre_ids.cpu().tolist() if self._pre_ids is not None else None
@@ -410,6 +429,9 @@ class MoeInstrumentationRecorder:
                     "padded_request_count": batch.padded_size,
                     "token_row_count": rows,
                     "active_token_row_count": batch.size if batch.is_decode else rows,
+                    "request_sequence_ids": request_sequence_ids,
+                    "token_row_sequence_ids": token_row_sequence_ids,
+                    "token_positions": token_positions,
                 },
                 "layers": layer_records,
             }

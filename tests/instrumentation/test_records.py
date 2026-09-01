@@ -37,6 +37,8 @@ def _run(*, mode: str = "offload") -> dict:
             "capacity_objects": 2,
             "policy": "lru",
             "expert_object_bytes": 10,
+            "initial_resident_objects": [],
+            "initial_state_boundary": "before_first_observed_forward",
             "reason": None,
         }
         if mode == "offload"
@@ -45,6 +47,8 @@ def _run(*, mode: str = "offload") -> dict:
             "capacity_objects": None,
             "policy": None,
             "expert_object_bytes": None,
+            "initial_resident_objects": None,
+            "initial_state_boundary": None,
             "reason": "fused experts are resident",
         }
     )
@@ -57,6 +61,7 @@ def _run(*, mode: str = "offload") -> dict:
         "created_at_utc": "2026-09-01T00:00:00.000Z",
         "runtime": "freetoken",
         "execution_mode": mode,
+        "sequence_id_namespace": "freetoken-request-uid",
         "model": {
             "id": "tiny-gpt-oss",
             "num_moe_layers": 1,
@@ -89,6 +94,9 @@ def _offload_forward() -> dict:
             "padded_request_count": 2,
             "token_row_count": 2,
             "active_token_row_count": 1,
+            "request_sequence_ids": [7],
+            "token_row_sequence_ids": [7, None],
+            "token_positions": [12, None],
         },
         "layers": [
             {
@@ -233,6 +241,10 @@ def test_rejects_non_monotonic_trace(tmp_path: Path) -> None:
             lambda event: event["layers"][0]["transfers"]["h2d"].update(bytes=19),
             "must equal load bytes",
         ),
+        (
+            lambda event: event["batch"]["token_row_sequence_ids"].__setitem__(1, 7),
+            "identity and position must both be null",
+        ),
     ],
 )
 def test_rejects_inconsistent_movement(mutation, message: str) -> None:
@@ -284,6 +296,8 @@ def test_writer_refuses_overwrite_and_binds_aggregate(tmp_path: Path) -> None:
             "capacity_objects": None,
             "policy": None,
             "expert_object_bytes": None,
+            "initial_resident_objects": None,
+            "initial_state_boundary": None,
             "reason": "fused experts are resident",
         },
     )
@@ -329,6 +343,8 @@ def test_writer_refuses_overwrite_and_binds_aggregate(tmp_path: Path) -> None:
                 "capacity_objects": None,
                 "policy": None,
                 "expert_object_bytes": None,
+                "initial_resident_objects": None,
+                "initial_state_boundary": None,
                 "reason": "fused experts are resident",
             },
         )

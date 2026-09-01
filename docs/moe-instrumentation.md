@@ -42,10 +42,18 @@ Each forward record includes the phase and, for decode, a zero-based decode step
 Each layer records the raw requested expert ids before an offload kernel rewrites
 them to cache slots.
 
+The run declares the `freetoken-request-uid` sequence-id namespace. Each batch
+records active `request_sequence_ids` and aligns every route row with a
+`token_row_sequence_ids` entry and zero-based `token_positions` entry. These ids
+remain stable for the lifetime of a request. FreeToken exposes the same uid in
+the OpenAI response id as `chatcmpl-<uid>`, which allows a harness to join a
+runtime sequence back to its workload request without relying on arrival order.
+
 Decode CUDA graphs may execute padded dummy rows. `token_row_count` includes every
 executed row because a padded route can affect the real cache state. The first
 `active_token_row_count` rows correspond to active requests; the remainder are
-padding. Prefill rows are all active tokens.
+padding and have null sequence ids and positions. Prefill rows are all active
+tokens and appear in request order.
 
 Residency hits and misses count unique `(layer, expert)` objects requested in one
 layer forward, against the cache state immediately before admission. Loads,
@@ -61,6 +69,10 @@ directly. FreeToken keeps authoritative expert weights in host memory, so an
 eviction discards a device copy and D2H expert transfer is `not_applicable`.
 Fused execution has no expert cache, so cache residency and expert transfers are
 also `not_applicable`, not zero.
+
+Offload runs declare an empty `initial_resident_objects` set at the
+`before_first_observed_forward` boundary. Ordered layer transitions can therefore
+reconstruct the cache state without assuming an unreported warm state.
 
 ## Timing overhead
 

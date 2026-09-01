@@ -143,6 +143,8 @@ def validate_run_record(record: Mapping[str, Any]) -> None:
     mode = record.get("execution_mode")
     if mode not in {"fused", "offload"}:
         raise InstrumentationError("run.execution_mode: must be fused or offload")
+    if record.get("sequence_id_namespace") != "freetoken-request-uid":
+        raise InstrumentationError("run.sequence_id_namespace: unsupported namespace")
     model = _require_mapping(record.get("model"), "run.model")
     for field in ("num_moe_layers", "num_experts", "experts_per_token"):
         _require_int(model.get(field), f"run.model.{field}", minimum=1)
@@ -158,8 +160,26 @@ def validate_run_record(record: Mapping[str, Any]) -> None:
             "run.expert_cache.expert_object_bytes",
             minimum=1,
         )
+        initial = _require_list(
+            cache.get("initial_resident_objects"),
+            "run.expert_cache.initial_resident_objects",
+        )
+        if initial:
+            raise InstrumentationError(
+                "run.expert_cache.initial_resident_objects: FreeToken starts with an empty cache"
+            )
+        if cache.get("initial_state_boundary") != "before_first_observed_forward":
+            raise InstrumentationError(
+                "run.expert_cache.initial_state_boundary: unsupported boundary"
+            )
     else:
-        for field in ("capacity_objects", "policy", "expert_object_bytes"):
+        for field in (
+            "capacity_objects",
+            "policy",
+            "expert_object_bytes",
+            "initial_resident_objects",
+            "initial_state_boundary",
+        ):
             if cache.get(field) is not None:
                 raise InstrumentationError(
                     f"run.expert_cache.{field}: must be null when cache is not applicable"
@@ -426,10 +446,43 @@ def validate_forward_record(record: Mapping[str, Any], run: Mapping[str, Any]) -
         "forward.batch.active_token_row_count",
         minimum=1,
     )
+    request_sequence_ids = _require_list(
+        batch.get("request_sequence_ids"), "forward.batch.request_sequence_ids"
+    )
+    token_sequence_ids = _require_list(
+        batch.get("token_row_sequence_ids"), "forward.batch.token_row_sequence_ids"
+    )
+    token_positions = _require_list(
+        batch.get("token_positions"), "forward.batch.token_positions"
+    )
     if padded_count < request_count:
         raise InstrumentationError("forward.batch: padded count is smaller than request count")
     if active_rows > token_rows:
         raise InstrumentationError("forward.batch: active rows exceed executed token rows")
+    if len(request_sequence_ids) != request_count:
+        raise InstrumentationError(
+            "forward.batch.request_sequence_ids: count must equal request_count"
+        )
+    for index, sequence_id in enumerate(request_sequence_ids):
+        _require_int(sequence_id, f"forward.batch.request_sequence_ids[{index}]")
+    if len(set(request_sequence_ids)) != len(request_sequence_ids):
+        raise InstrumentationError("forward.batch.request_sequence_ids: values must be unique")
+    if len(token_sequence_ids) != token_rows or len(token_positions) != token_rows:
+        raise InstrumentationError(
+            "forward.batch: token identity arrays must equal token_row_count"
+        )
+    for index, (sequence_id, position) in enumerate(
+        zip(token_sequence_ids, token_positions, strict=True)
+    ):
+        if sequence_id is None or position is None:
+            if sequence_id is not None or position is not None:
+                raise InstrumentationError(
+                    f"forward.batch.token_row_sequence_ids[{index}]: identity and position "
+                    "must both be null"
+                )
+            continue
+        _require_int(sequence_id, f"forward.batch.token_row_sequence_ids[{index}]")
+        _require_int(position, f"forward.batch.token_positions[{index}]")
     if phase == "decode":
         if token_rows != padded_count:
             raise InstrumentationError(
@@ -439,6 +492,31 @@ def validate_forward_record(record: Mapping[str, Any], run: Mapping[str, Any]) -
             raise InstrumentationError(
                 "forward.batch.active_token_row_count: decode rows must equal requests"
             )
+        if list(token_sequence_ids[:active_rows]) != list(request_sequence_ids):
+            raise InstrumentationError(
+                "forward.batch.token_row_sequence_ids: active decode rows must match requests"
+            )
+        if any(value is not None for value in token_sequence_ids[active_rows:]):
+            raise InstrumentationError(
+                "forward.batch.token_row_sequence_ids: padded decode rows must be null"
+            )
+    else:
+        if active_rows != token_rows or padded_count != request_count:
+            raise InstrumentationError("forward.batch: prefill rows cannot be padding")
+        expected_request_order = list(dict.fromkeys(token_sequence_ids))
+        if expected_request_order != list(request_sequence_ids):
+            raise InstrumentationError(
+                "forward.batch.token_row_sequence_ids: prefill rows must follow request order"
+            )
+        prior_by_sequence: dict[int, int] = {}
+        for sequence_id, position in zip(token_sequence_ids, token_positions, strict=True):
+            assert isinstance(sequence_id, int) and isinstance(position, int)
+            prior = prior_by_sequence.get(sequence_id)
+            if prior is not None and position != prior + 1:
+                raise InstrumentationError(
+                    "forward.batch.token_positions: prefill positions must be contiguous"
+                )
+            prior_by_sequence[sequence_id] = position
     model = run["model"]
     layers = _require_list(record.get("layers"), "forward.layers")
     if len(layers) != model["num_moe_layers"]:
@@ -495,6 +573,7 @@ def load_event_file(path: Path) -> list[dict[str, Any]]:
     validate_run_record(records[0])
     run = records[0]
     prior_end = run["timestamp_monotonic_ns"]
+    prior_position_by_sequence: dict[int, int] = {}
     saw_end = False
     for expected_sequence, record in enumerate(records[1:], start=1):
         if record.get("sequence") != expected_sequence:
@@ -509,6 +588,18 @@ def load_event_file(path: Path) -> list[dict[str, Any]]:
             if record["started_monotonic_ns"] < prior_end:
                 raise InstrumentationError(f"{path}: forward timestamps are not monotonic")
             prior_end = record["ended_monotonic_ns"]
+            batch = record["batch"]
+            for sequence_id, position in zip(
+                batch["token_row_sequence_ids"], batch["token_positions"], strict=True
+            ):
+                if sequence_id is None:
+                    continue
+                prior_position = prior_position_by_sequence.get(sequence_id)
+                if prior_position is not None and position != prior_position + 1:
+                    raise InstrumentationError(
+                        f"{path}: token positions are not contiguous for sequence {sequence_id}"
+                    )
+                prior_position_by_sequence[sequence_id] = position
         elif record_type == "run_end":
             if saw_end or expected_sequence != len(records) - 1:
                 raise InstrumentationError(f"{path}: run_end must be the final record")
@@ -695,6 +786,7 @@ class MoeEventWriter:
             "created_at_utc": _utc_now(),
             "runtime": "freetoken",
             "execution_mode": execution_mode,
+            "sequence_id_namespace": "freetoken-request-uid",
             "model": dict(model),
             "expert_cache": dict(expert_cache),
             "clock": {

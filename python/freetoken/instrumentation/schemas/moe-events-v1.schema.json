@@ -19,6 +19,8 @@
         "capacity_objects",
         "policy",
         "expert_object_bytes",
+        "initial_resident_objects",
+        "initial_state_boundary",
         "reason"
       ],
       "properties": {
@@ -26,6 +28,16 @@
         "capacity_objects": {"type": ["integer", "null"], "minimum": 1},
         "policy": {"type": ["string", "null"], "minLength": 1},
         "expert_object_bytes": {"type": ["integer", "null"], "minimum": 1},
+        "initial_resident_objects": {
+          "oneOf": [
+            {"type": "array", "maxItems": 0},
+            {"type": "null"}
+          ]
+        },
+        "initial_state_boundary": {
+          "type": ["string", "null"],
+          "enum": ["before_first_observed_forward", null]
+        },
         "reason": {"type": ["string", "null"], "minLength": 1}
       },
       "allOf": [
@@ -36,6 +48,8 @@
               "capacity_objects": {"type": "integer"},
               "policy": {"type": "string"},
               "expert_object_bytes": {"type": "integer"},
+              "initial_resident_objects": {"type": "array", "maxItems": 0},
+              "initial_state_boundary": {"const": "before_first_observed_forward"},
               "reason": {"type": "null"}
             }
           },
@@ -44,6 +58,8 @@
               "capacity_objects": {"type": "null"},
               "policy": {"type": "null"},
               "expert_object_bytes": {"type": "null"},
+              "initial_resident_objects": {"type": "null"},
+              "initial_state_boundary": {"type": "null"},
               "reason": {"type": "string"}
             }
           }
@@ -260,6 +276,7 @@
         "created_at_utc",
         "runtime",
         "execution_mode",
+        "sequence_id_namespace",
         "model",
         "expert_cache",
         "clock"
@@ -273,6 +290,7 @@
         "created_at_utc": {"type": "string", "minLength": 1},
         "runtime": {"const": "freetoken"},
         "execution_mode": {"enum": ["fused", "offload"]},
+        "sequence_id_namespace": {"const": "freetoken-request-uid"},
         "model": {
           "type": "object",
           "additionalProperties": false,
@@ -336,13 +354,32 @@
             "request_count",
             "padded_request_count",
             "token_row_count",
-            "active_token_row_count"
+            "active_token_row_count",
+            "request_sequence_ids",
+            "token_row_sequence_ids",
+            "token_positions"
           ],
           "properties": {
             "request_count": {"type": "integer", "minimum": 1},
             "padded_request_count": {"type": "integer", "minimum": 1},
             "token_row_count": {"type": "integer", "minimum": 1},
-            "active_token_row_count": {"type": "integer", "minimum": 1}
+            "active_token_row_count": {"type": "integer", "minimum": 1},
+            "request_sequence_ids": {
+              "type": "array",
+              "items": {"type": "integer", "minimum": 0},
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "token_row_sequence_ids": {
+              "type": "array",
+              "items": {"type": ["integer", "null"], "minimum": 0},
+              "minItems": 1
+            },
+            "token_positions": {
+              "type": "array",
+              "items": {"type": ["integer", "null"], "minimum": 0},
+              "minItems": 1
+            }
           }
         },
         "layers": {"type": "array", "items": {"$ref": "#/$defs/layer"}}
