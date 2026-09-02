@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import freetoken.layers.moe as moe_layers
+from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated, MoELayer, OffloadMoELayer
 from freetoken.moe import is_offload_moe_backend
 from freetoken.moe.fused_mxfp4 import (
@@ -20,8 +21,17 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
+def _instrumentation():
+    """Return the optional recorder without affecting standalone layer tests."""
+
+    try:
+        return get_global_ctx().moe_instrumentation
+    except AssertionError:
+        return None
+
+
 class GptOssMxfp4TritonMoELayer(MoELayer):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, layer_id: int = 0):
         tp_info = moe_layers.get_tp_info()
         _, _, local_intermediate = local_mxfp4_intermediate_range(
             config.moe_intermediate_size,
@@ -44,6 +54,7 @@ class GptOssMxfp4TritonMoELayer(MoELayer):
             weight_format="mxfp4_triton",
         )
         self.local_intermediate_size = local_intermediate
+        self.layer_id = layer_id
         self.hidden_act_alpha = config.hidden_act_alpha
         self.swiglu_limit = config.swiglu_limit
 
@@ -130,25 +141,34 @@ class GptOssMxfp4TritonMoELayer(MoELayer):
             router_logits = router_logits.contiguous()
 
         topk_weights, topk_ids = self._topk(router_logits)
+        instrumentation = _instrumentation()
+        if instrumentation is not None:
+            instrumentation.record_routes(self.layer_id, topk_ids)
         self._ensure_decode_weights()
-        if hidden_states.shape[0] <= MXFP4_DECODE_MAX_TOKENS:
-            output = run_mxfp4_splitk_decode_experts(
-                hidden_states, topk_weights, topk_ids,
-                self._gu_blocks_t, self._gu_scales_t, self.gate_up_proj_bias,
-                self._dn_blocks_t, self._dn_scales_t, self.down_proj_bias,
-                top_k=self.top_k,
-                hidden_act_alpha=self.hidden_act_alpha,
-                swiglu_limit=self.swiglu_limit,
-            )
-        else:
-            output = run_mxfp4_prefill_experts_t(
-                hidden_states, topk_weights, topk_ids,
-                self._gu_blocks_t, self._gu_scales_t, self.gate_up_proj_bias,
-                self._dn_blocks_t, self._dn_scales_t, self.down_proj_bias,
-                top_k=self.top_k,
-                hidden_act_alpha=self.hidden_act_alpha,
-                swiglu_limit=self.swiglu_limit,
-            )
+        if instrumentation is not None:
+            instrumentation.begin_compute(self.layer_id)
+        try:
+            if hidden_states.shape[0] <= MXFP4_DECODE_MAX_TOKENS:
+                output = run_mxfp4_splitk_decode_experts(
+                    hidden_states, topk_weights, topk_ids,
+                    self._gu_blocks_t, self._gu_scales_t, self.gate_up_proj_bias,
+                    self._dn_blocks_t, self._dn_scales_t, self.down_proj_bias,
+                    top_k=self.top_k,
+                    hidden_act_alpha=self.hidden_act_alpha,
+                    swiglu_limit=self.swiglu_limit,
+                )
+            else:
+                output = run_mxfp4_prefill_experts_t(
+                    hidden_states, topk_weights, topk_ids,
+                    self._gu_blocks_t, self._gu_scales_t, self.gate_up_proj_bias,
+                    self._dn_blocks_t, self._dn_scales_t, self.down_proj_bias,
+                    top_k=self.top_k,
+                    hidden_act_alpha=self.hidden_act_alpha,
+                    swiglu_limit=self.swiglu_limit,
+                )
+        finally:
+            if instrumentation is not None:
+                instrumentation.end_compute(self.layer_id)
         return self._maybe_all_reduce(output)
 
 
@@ -208,7 +228,10 @@ class GptOssMLP(BaseOP):
             assert layer_id is not None
             self.experts = GptOssMxfp4OffloadMoELayer(config, layer_id)
         else:
-            self.experts = GptOssMxfp4TritonMoELayer(config)
+            self.experts = GptOssMxfp4TritonMoELayer(
+                config,
+                layer_id if layer_id is not None else 0,
+            )
         self._layer_id = layer_id
 
     @nvtx_annotate("MoE")

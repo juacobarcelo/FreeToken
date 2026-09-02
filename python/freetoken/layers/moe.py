@@ -219,6 +219,15 @@ class OffloadMoELayer(MoELayer):
         self.layer_id = layer_id
         self.offload_cache: OffloadMoeCache | None = None
 
+    @staticmethod
+    def _instrumentation():
+        """Return the optional recorder without affecting standalone layer tests."""
+
+        try:
+            return get_global_ctx().moe_instrumentation
+        except AssertionError:
+            return None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -245,6 +254,9 @@ class OffloadMoELayer(MoELayer):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
         ctx = get_global_ctx()
+        instrumentation = self._instrumentation()
+        if instrumentation is not None:
+            instrumentation.record_routes(self.layer_id, topk_ids)
         if ctx.batch.is_prefill:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
@@ -262,6 +274,9 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        instrumentation = self._instrumentation()
+        if instrumentation is not None:
+            instrumentation.record_routes(self.layer_id, topk_ids)
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -275,6 +290,9 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        instrumentation = self._instrumentation()
+        if instrumentation is not None:
+            instrumentation.record_routes(self.layer_id, topk_ids)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
@@ -429,6 +447,36 @@ class OffloadMoELayer(MoELayer):
     # ------------------------------------------------------------------
 
     def _expert_gemm(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        views: tuple[torch.Tensor, ...],
+        n: int | None,
+        alphas: tuple[torch.Tensor, torch.Tensor] | None,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        instrumentation = self._instrumentation()
+        if instrumentation is not None:
+            instrumentation.begin_compute(self.layer_id)
+        try:
+            return self._expert_gemm_impl(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=views,
+                n=n,
+                alphas=alphas,
+                is_prefill=is_prefill,
+            )
+        finally:
+            if instrumentation is not None:
+                instrumentation.end_compute(self.layer_id)
+
+    def _expert_gemm_impl(
         self,
         cache: OffloadMoeCache,
         hidden_states: torch.Tensor,

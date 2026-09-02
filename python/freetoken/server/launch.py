@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import signal
 import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -44,6 +45,12 @@ def _detach_process_group() -> None:
         os.setpgrp()
     except OSError:  # no job control (already a group leader / unusual environment)
         pass
+
+
+def _raise_keyboard_interrupt(_signum: int, _frame: object) -> None:
+    """Route an orderly worker SIGTERM through the existing cleanup path."""
+
+    raise KeyboardInterrupt
 
 
 def _run_tokenize_worker(detach: bool, **kwargs) -> None:
@@ -102,6 +109,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         if args.silent_output:
             logging.disable(logging.INFO)
 
+        previous_sigterm = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
         try:
             scheduler.run_forever()
         except KeyboardInterrupt:
@@ -110,6 +118,8 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")
             scheduler.shutdown()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def launch_server(

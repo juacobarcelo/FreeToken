@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.moe import BaseMoeBackend
     from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.instrumentation.recorder import MoeInstrumentationRecorder
 
 
 @dataclass
@@ -172,6 +173,7 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
     moe_offload_cache: OffloadMoeCache | None = None
+    moe_instrumentation: MoeInstrumentationRecorder | None = None
     kv_cache: BaseKVCachePool = field(init=False)
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.

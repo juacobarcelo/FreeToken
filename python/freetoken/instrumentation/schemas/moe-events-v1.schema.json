@@ -1,0 +1,415 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juacobarcelo/FreeToken/schemas/moe-events-v1.schema.json",
+  "title": "FreeToken MoE instrumentation event schema 1.0",
+  "oneOf": [
+    {"$ref": "#/$defs/run"},
+    {"$ref": "#/$defs/forward"},
+    {"$ref": "#/$defs/runEnd"}
+  ],
+  "$defs": {
+    "availability": {
+      "enum": ["measured", "unavailable", "unsupported", "not_applicable"]
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "capacity_objects",
+        "policy",
+        "expert_object_bytes",
+        "initial_resident_objects",
+        "initial_state_boundary",
+        "reason"
+      ],
+      "properties": {
+        "availability": {"$ref": "#/$defs/availability"},
+        "capacity_objects": {"type": ["integer", "null"], "minimum": 1},
+        "policy": {"type": ["string", "null"], "minLength": 1},
+        "expert_object_bytes": {"type": ["integer", "null"], "minimum": 1},
+        "initial_resident_objects": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {"$ref": "#/$defs/eviction"},
+              "uniqueItems": true
+            },
+            {"type": "null"}
+          ]
+        },
+        "initial_state_boundary": {
+          "type": ["string", "null"],
+          "enum": ["before_first_observed_forward", null]
+        },
+        "reason": {"type": ["string", "null"], "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"availability": {"const": "measured"}}},
+          "then": {
+            "properties": {
+              "capacity_objects": {"type": "integer"},
+              "policy": {"type": "string"},
+              "expert_object_bytes": {"type": "integer"},
+              "initial_resident_objects": {"type": "array"},
+              "initial_state_boundary": {"const": "before_first_observed_forward"},
+              "reason": {"type": "null"}
+            }
+          },
+          "else": {
+            "properties": {
+              "capacity_objects": {"type": "null"},
+              "policy": {"type": "null"},
+              "expert_object_bytes": {"type": "null"},
+              "initial_resident_objects": {"type": "null"},
+              "initial_state_boundary": {"type": "null"},
+              "reason": {"type": "string"}
+            }
+          }
+        }
+      ]
+    },
+    "residency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "hit_count", "miss_count", "unit", "reason"],
+      "properties": {
+        "availability": {"$ref": "#/$defs/availability"},
+        "hit_count": {"type": ["integer", "null"], "minimum": 0},
+        "miss_count": {"type": ["integer", "null"], "minimum": 0},
+        "unit": {"const": "unique_expert_objects"},
+        "reason": {"type": ["string", "null"], "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"availability": {"const": "measured"}}},
+          "then": {
+            "properties": {
+              "hit_count": {"type": "integer"},
+              "miss_count": {"type": "integer"},
+              "reason": {"type": "null"}
+            }
+          },
+          "else": {
+            "properties": {
+              "hit_count": {"type": "null"},
+              "miss_count": {"type": "null"},
+              "reason": {"type": "string"}
+            }
+          }
+        }
+      ]
+    },
+    "transfer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "operation_count",
+        "object_count",
+        "bytes",
+        "duration_ns",
+        "duration_clock",
+        "reason"
+      ],
+      "properties": {
+        "availability": {"$ref": "#/$defs/availability"},
+        "operation_count": {"type": ["integer", "null"], "minimum": 0},
+        "object_count": {"type": ["integer", "null"], "minimum": 0},
+        "bytes": {"type": ["integer", "null"], "minimum": 0},
+        "duration_ns": {"type": ["integer", "null"], "minimum": 0},
+        "duration_clock": {"type": ["string", "null"]},
+        "reason": {"type": ["string", "null"], "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"availability": {"const": "measured"}}},
+          "then": {
+            "properties": {
+              "operation_count": {"type": "integer"},
+              "object_count": {"type": "integer"},
+              "bytes": {"type": "integer"},
+              "duration_ns": {"type": "integer"},
+              "duration_clock": {"const": "cuda_event"},
+              "reason": {"type": "null"}
+            }
+          },
+          "else": {
+            "properties": {
+              "operation_count": {"type": "null"},
+              "object_count": {"type": "null"},
+              "bytes": {"type": "null"},
+              "duration_ns": {"type": "null"},
+              "duration_clock": {"type": "null"},
+              "reason": {"type": "string"}
+            }
+          }
+        }
+      ]
+    },
+    "compute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "duration_ns", "duration_clock", "boundary", "reason"],
+      "properties": {
+        "availability": {"$ref": "#/$defs/availability"},
+        "duration_ns": {"type": ["integer", "null"], "minimum": 0},
+        "duration_clock": {"type": ["string", "null"]},
+        "boundary": {"type": ["string", "null"], "minLength": 1},
+        "reason": {"type": ["string", "null"], "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"availability": {"const": "measured"}}},
+          "then": {
+            "properties": {
+              "duration_ns": {"type": "integer"},
+              "duration_clock": {"const": "cuda_event"},
+              "boundary": {"type": "string"},
+              "reason": {"type": "null"}
+            }
+          },
+          "else": {
+            "properties": {
+              "duration_ns": {"type": "null"},
+              "duration_clock": {"type": "null"},
+              "boundary": {"type": "null"},
+              "reason": {"type": "string"}
+            }
+          }
+        }
+      ]
+    },
+    "load": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer_id", "expert_id", "slot_id", "bytes", "destination"],
+      "properties": {
+        "layer_id": {"type": "integer", "minimum": 0},
+        "expert_id": {"type": "integer", "minimum": 0},
+        "slot_id": {"type": "integer", "minimum": 0},
+        "bytes": {"type": "integer", "minimum": 1},
+        "destination": {"enum": ["device_cache", "device_transient"]}
+      }
+    },
+    "eviction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer_id", "expert_id", "slot_id"],
+      "properties": {
+        "layer_id": {"type": "integer", "minimum": 0},
+        "expert_id": {"type": "integer", "minimum": 0},
+        "slot_id": {"type": "integer", "minimum": 0}
+      }
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer_id", "expert_id", "slot_id", "from", "to", "cause"],
+      "properties": {
+        "layer_id": {"type": "integer", "minimum": 0},
+        "expert_id": {"type": "integer", "minimum": 0},
+        "slot_id": {"type": "integer", "minimum": 0},
+        "from": {"type": "string", "minLength": 1},
+        "to": {"type": "string", "minLength": 1},
+        "cause": {"enum": ["load", "eviction"]}
+      }
+    },
+    "layer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "layer_id",
+        "requested_expert_ids",
+        "requested_shape",
+        "residency",
+        "loads",
+        "evictions",
+        "residency_transitions",
+        "transfers",
+        "compute"
+      ],
+      "properties": {
+        "layer_id": {"type": "integer", "minimum": 0},
+        "requested_expert_ids": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 0}
+          }
+        },
+        "requested_shape": {
+          "type": "array",
+          "prefixItems": [
+            {"type": "integer", "minimum": 0},
+            {"type": "integer", "minimum": 1}
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "residency": {"$ref": "#/$defs/residency"},
+        "loads": {"type": "array", "items": {"$ref": "#/$defs/load"}},
+        "evictions": {"type": "array", "items": {"$ref": "#/$defs/eviction"}},
+        "residency_transitions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/transition"}
+        },
+        "transfers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["h2d", "d2h"],
+          "properties": {
+            "h2d": {"$ref": "#/$defs/transfer"},
+            "d2h": {"$ref": "#/$defs/transfer"}
+          }
+        },
+        "compute": {"$ref": "#/$defs/compute"}
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "record_type",
+        "sequence",
+        "run_id",
+        "timestamp_monotonic_ns",
+        "created_at_utc",
+        "runtime",
+        "execution_mode",
+        "sequence_id_namespace",
+        "model",
+        "expert_cache",
+        "clock"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "record_type": {"const": "run"},
+        "sequence": {"const": 0},
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "timestamp_monotonic_ns": {"type": "integer", "minimum": 0},
+        "created_at_utc": {"type": "string", "minLength": 1},
+        "runtime": {"const": "freetoken"},
+        "execution_mode": {"enum": ["fused", "offload"]},
+        "sequence_id_namespace": {"const": "freetoken-request-uid"},
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "num_moe_layers", "num_experts", "experts_per_token"],
+          "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "num_moe_layers": {"type": "integer", "minimum": 1},
+            "num_experts": {"type": "integer", "minimum": 1},
+            "experts_per_token": {"type": "integer", "minimum": 1}
+          }
+        },
+        "expert_cache": {"$ref": "#/$defs/cache"},
+        "clock": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "timestamp_source",
+            "timestamp_unit",
+            "duration_source",
+            "duration_unit"
+          ],
+          "properties": {
+            "timestamp_source": {"const": "time.monotonic_ns"},
+            "timestamp_unit": {"const": "nanosecond"},
+            "duration_source": {"const": "cuda_event"},
+            "duration_unit": {"const": "nanosecond"}
+          }
+        }
+      }
+    },
+    "forward": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "record_type",
+        "sequence",
+        "run_id",
+        "execution_mode",
+        "phase",
+        "decode_step",
+        "started_monotonic_ns",
+        "ended_monotonic_ns",
+        "batch",
+        "layers"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "record_type": {"const": "forward"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "run_id": {"type": "string"},
+        "execution_mode": {"enum": ["fused", "offload"]},
+        "phase": {"enum": ["prefill", "decode"]},
+        "decode_step": {"type": ["integer", "null"], "minimum": 0},
+        "started_monotonic_ns": {"type": "integer", "minimum": 0},
+        "ended_monotonic_ns": {"type": "integer", "minimum": 0},
+        "batch": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "request_count",
+            "padded_request_count",
+            "token_row_count",
+            "active_token_row_count",
+            "request_sequence_ids",
+            "token_row_sequence_ids",
+            "token_positions"
+          ],
+          "properties": {
+            "request_count": {"type": "integer", "minimum": 1},
+            "padded_request_count": {"type": "integer", "minimum": 1},
+            "token_row_count": {"type": "integer", "minimum": 1},
+            "active_token_row_count": {"type": "integer", "minimum": 1},
+            "request_sequence_ids": {
+              "type": "array",
+              "items": {"type": "integer", "minimum": 0},
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "token_row_sequence_ids": {
+              "type": "array",
+              "items": {"type": ["integer", "null"], "minimum": 0},
+              "minItems": 1
+            },
+            "token_positions": {
+              "type": "array",
+              "items": {"type": ["integer", "null"], "minimum": 0},
+              "minItems": 1
+            }
+          }
+        },
+        "layers": {"type": "array", "items": {"$ref": "#/$defs/layer"}}
+      }
+    },
+    "runEnd": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "record_type",
+        "sequence",
+        "run_id",
+        "timestamp_monotonic_ns",
+        "ended_at_utc",
+        "status"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "record_type": {"const": "run_end"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "run_id": {"type": "string"},
+        "timestamp_monotonic_ns": {"type": "integer", "minimum": 0},
+        "ended_at_utc": {"type": "string", "minLength": 1},
+        "status": {"const": "complete"}
+      }
+    }
+  }
+}
