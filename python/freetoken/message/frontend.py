@@ -56,6 +56,9 @@ class UserReply(BaseFrontendMsg):
     finish_reason: str | None = None
     # The stop string that ended generation (Anthropic reports it as stop_reason='stop_sequence').
     matched_stop: str | None = None
+    # Raw sampled identities. This remains available even when a special/EOS token
+    # detokenizes to an empty string, allowing one-token output to be identified.
+    token_ids_delta: tuple[int, ...] = ()
 
 
 @dataclass
