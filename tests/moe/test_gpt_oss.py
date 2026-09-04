@@ -283,7 +283,7 @@ def test_causal_router_preserves_mxfp4_result(tmp_path, tp1):
     from freetoken.moe.causal_router import AlternativeAAdapter
     from freetoken.moe.fused_mxfp4 import run_mxfp4_splitk_decode_experts
 
-    dev = torch.device("cuda")
+    dev = torch.device("cuda:0")
     config = _tiny_config()
     cache = _make_offload_cache(config, dev, cache_size=config.num_experts)
     layer = GptOssMxfp4OffloadMoELayer(config, layer_id=0)
