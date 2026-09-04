@@ -16,16 +16,23 @@ ft serve --model /models/gpt-oss-20b \
   --moe-instrumentation-run-id offload-25-rep-01
 ```
 
-Schema 1.0 supports GPT-OSS, tensor-parallel size 1, and an effective `fused` or
-`offload` backend. It rejects hybrid/CPU execution, prefill hit-D2D, and MoE cache
-resizing during a run because those paths do not yet have complete evidence hooks.
-An `auto` request is accepted only when it resolves to `offload`.
+Schema 1.1 supports GPT-OSS, tensor-parallel sizes 1 and 2, and an effective
+`fused` or `offload` backend. It rejects hybrid/CPU execution, prefill hit-D2D,
+and MoE cache resizing during a run because those paths do not yet have complete
+evidence hooks. An `auto` request is accepted only when it resolves to `offload`.
+Schema 1.0 TP1 event streams remain readable.
 
 The output directory receives:
 
-- `<run-id>.events.jsonl`: append-only run, forward, and clean-run-end records;
-- `<run-id>.aggregate.json`: a deterministic summary bound to the event file by
-  SHA-256, written on clean shutdown.
+- TP1: `<run-id>.events.jsonl` and `<run-id>.aggregate.json`;
+- TP2: one pair per rank, named
+  `<run-id>.tp-rank-<rank>-of-02.{events.jsonl,aggregate.json}`.
+
+Each stream is append-only and each deterministic aggregate is bound to its event
+file by SHA-256 and written on clean shutdown. The run and aggregate records carry
+the rank, world size, and the declaration that router choices are replicated.
+Consumers must reconcile both TP2 streams and reject any route disagreement; a
+single rank is not complete TP2 route evidence.
 
 Existing files are never overwritten. Stop the server cleanly to obtain the
 aggregate. An interrupted JSONL file remains useful as partial evidence, but its

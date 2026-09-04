@@ -66,6 +66,11 @@ def _run(*, mode: str = "offload") -> dict:
         "runtime": "freetoken",
         "execution_mode": mode,
         "sequence_id_namespace": "freetoken-request-uid",
+        "tensor_parallel": {
+            "rank": 0,
+            "world_size": 1,
+            "route_replication": "replicated",
+        },
         "model": {
             "id": "tiny-gpt-oss",
             "num_moe_layers": 1,
@@ -361,6 +366,11 @@ def test_writer_refuses_overwrite_and_binds_aggregate(tmp_path: Path) -> None:
 
     assert aggregate is not None
     assert aggregate["complete"] is True
+    assert aggregate["tensor_parallel"] == {
+        "rank": 0,
+        "world_size": 1,
+        "route_replication": "replicated",
+    }
     assert len(aggregate["source"]["events_sha256"]) == 64
     with pytest.raises(InstrumentationError, match="overwrite"):
         MoeEventWriter(
@@ -385,6 +395,75 @@ def test_writer_refuses_overwrite_and_binds_aggregate(tmp_path: Path) -> None:
         )
 
 
+def test_tp2_writers_use_unique_rank_paths_and_metadata(tmp_path: Path) -> None:
+    common = {
+        "execution_mode": "fused",
+        "model": {
+            "id": "tiny-gpt-oss",
+            "num_moe_layers": 1,
+            "num_experts": 4,
+            "experts_per_token": 2,
+        },
+        "expert_cache": {
+            "availability": "not_applicable",
+            "capacity_objects": None,
+            "policy": None,
+            "expert_object_bytes": None,
+            "initial_resident_objects": None,
+            "initial_state_boundary": None,
+            "reason": "fused experts are resident",
+        },
+    }
+    rank_zero = MoeEventWriter(
+        tmp_path,
+        "writer-tp2",
+        **common,
+        tensor_parallel={
+            "rank": 0,
+            "world_size": 2,
+            "route_replication": "replicated",
+        },
+    )
+    rank_one = MoeEventWriter(
+        tmp_path,
+        "writer-tp2",
+        **common,
+        tensor_parallel={
+            "rank": 1,
+            "world_size": 2,
+            "route_replication": "replicated",
+        },
+    )
+
+    assert rank_zero.events_path.name == "writer-tp2.tp-rank-00-of-02.events.jsonl"
+    assert rank_one.events_path.name == "writer-tp2.tp-rank-01-of-02.events.jsonl"
+    assert rank_zero.events_path != rank_one.events_path
+    assert json.loads(rank_zero.events_path.read_text().splitlines()[0])[
+        "tensor_parallel"
+    ]["rank"] == 0
+    assert json.loads(rank_one.events_path.read_text().splitlines()[0])[
+        "tensor_parallel"
+    ]["rank"] == 1
+    rank_zero.close()
+    rank_one.close()
+
+
+def test_schema_10_trace_remains_readable(tmp_path: Path) -> None:
+    records = [_run(), _offload_forward(), _run_end()]
+    records[0].pop("tensor_parallel")
+    for record in records:
+        record["schema_version"] = "1.0"
+    path = tmp_path / "legacy.events.jsonl"
+    _write_jsonl(path, records)
+
+    loaded = load_event_file(path)
+    aggregate = aggregate_records(loaded)
+
+    assert loaded[0]["schema_version"] == "1.0"
+    assert aggregate["event_schema_version"] == "1.0"
+    assert aggregate["tensor_parallel"]["world_size"] == 1
+
+
 def test_schema_files_match_code_versions() -> None:
     schema_dir = (
         Path(__file__).parents[2]
@@ -398,7 +477,7 @@ def test_schema_files_match_code_versions() -> None:
 
     assert events["$defs"]["run"]["properties"]["schema_version"]["const"] == EVENT_SCHEMA_VERSION
     assert aggregate["properties"]["schema_version"]["const"] == AGGREGATE_SCHEMA_VERSION
-    assert aggregate["properties"]["event_schema_version"]["const"] == EVENT_SCHEMA_VERSION
+    assert EVENT_SCHEMA_VERSION in aggregate["properties"]["event_schema_version"]["enum"]
 
 
 @pytest.mark.parametrize("run_id", ["../escape", "has spaces", "", "x" * 129])

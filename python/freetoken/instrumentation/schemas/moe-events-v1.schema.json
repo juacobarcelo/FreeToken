@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/juacobarcelo/FreeToken/schemas/moe-events-v1.schema.json",
-  "title": "FreeToken MoE instrumentation event schema 1.0",
+  "title": "FreeToken MoE instrumentation event schema 1.1",
   "oneOf": [
     {"$ref": "#/$defs/run"},
     {"$ref": "#/$defs/forward"},
@@ -10,6 +10,16 @@
   "$defs": {
     "availability": {
       "enum": ["measured", "unavailable", "unsupported", "not_applicable"]
+    },
+    "tensorParallel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rank", "world_size", "route_replication"],
+      "properties": {
+        "rank": {"type": "integer", "minimum": 0},
+        "world_size": {"type": "integer", "minimum": 1},
+        "route_replication": {"const": "replicated"}
+      }
     },
     "cache": {
       "type": "object",
@@ -281,12 +291,13 @@
         "runtime",
         "execution_mode",
         "sequence_id_namespace",
+        "tensor_parallel",
         "model",
         "expert_cache",
         "clock"
       ],
       "properties": {
-        "schema_version": {"const": "1.0"},
+        "schema_version": {"const": "1.1"},
         "record_type": {"const": "run"},
         "sequence": {"const": 0},
         "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
@@ -295,6 +306,7 @@
         "runtime": {"const": "freetoken"},
         "execution_mode": {"enum": ["fused", "offload"]},
         "sequence_id_namespace": {"const": "freetoken-request-uid"},
+        "tensor_parallel": {"$ref": "#/$defs/tensorParallel"},
         "model": {
           "type": "object",
           "additionalProperties": false,
@@ -342,7 +354,7 @@
         "layers"
       ],
       "properties": {
-        "schema_version": {"const": "1.0"},
+        "schema_version": {"const": "1.1"},
         "record_type": {"const": "forward"},
         "sequence": {"type": "integer", "minimum": 1},
         "run_id": {"type": "string"},
@@ -402,7 +414,7 @@
         "status"
       ],
       "properties": {
-        "schema_version": {"const": "1.0"},
+        "schema_version": {"const": "1.1"},
         "record_type": {"const": "run_end"},
         "sequence": {"type": "integer", "minimum": 1},
         "run_id": {"type": "string"},
