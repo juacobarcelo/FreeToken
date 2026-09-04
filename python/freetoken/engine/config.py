@@ -43,6 +43,9 @@ class EngineConfig:
     # recorder remains absent and writes no files by default.
     moe_instrumentation_dir: str | None = None
     moe_instrumentation_run_id: str | None = None
+    # Optional InferenceSystemPlanner Alternative A configuration. The adapter is
+    # absent by default and loaded lazily only for the controlled GPT-OSS experiment.
+    moe_router_config: str | None = None
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

@@ -595,6 +595,15 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
+        if config.moe_router_config:
+            from freetoken.moe.causal_router import AlternativeAAdapter
+
+            cache.causal_router = AlternativeAAdapter(
+                config_path=config.moe_router_config,
+                cache=cache,
+                batch_size=config.max_running_req,
+                tensor_parallel_size=config.tp_info.size,
+            )
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -749,6 +758,15 @@ class Engine:
             raise CacheRebuildRejected(
                 "moe_cache_size cannot change during an instrumented run; restart the "
                 "server with a new run id and the target cache size"
+            )
+        if (
+            moe_cache_size is not None
+            and self.moe_offload_cache is not None
+            and self.moe_offload_cache.causal_router is not None
+        ):
+            raise CacheRebuildRejected(
+                "moe_cache_size cannot change while the causal router is attached; "
+                "restart with a matching versioned router configuration"
             )
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
@@ -1106,6 +1124,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_router_config": None,
     "expert_load": "auto",
 }
 
@@ -1129,11 +1148,15 @@ def _adjust_config(config: EngineConfig):
         instrumentation_dir,
         instrumentation_run_id,
     )
+    if config.moe_router_config and (
+        not is_moe or getattr(model_config, "model_type", None) != "gpt_oss"
+    ):
+        raise ValueError("--moe-router-config currently supports GPT-OSS only")
     if instrumentation_is_enabled:
         if not is_moe:
             raise ValueError("MoE instrumentation requires a model with routed experts")
         if getattr(model_config, "model_type", None) != "gpt_oss":
-            raise ValueError("MoE instrumentation schema 1.0 currently supports gpt_oss only")
+            raise ValueError("MoE instrumentation schema 1.1 currently supports gpt_oss only")
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
         # is worse than inert -- engine init would build an expert cache for a model that has
@@ -1331,15 +1354,37 @@ def _adjust_config(config: EngineConfig):
     if instrumentation_is_enabled:
         if config.moe_backend not in {"fused", "offload"}:
             raise ValueError(
-                "MoE instrumentation schema 1.0 supports resolved fused and offload "
+                "MoE instrumentation schema 1.1 supports resolved fused and offload "
                 f"backends, got {config.moe_backend!r}"
             )
-        if config.tp_info.size != 1:
-            raise ValueError("MoE instrumentation schema 1.0 supports tensor parallel size 1")
+        if config.tp_info.size not in {1, 2}:
+            raise ValueError(
+                "MoE instrumentation schema 1.1 supports tensor parallel sizes 1 and 2"
+            )
         if config.moe_prefill_hit_d2d:
             raise ValueError(
-                "MoE instrumentation schema 1.0 does not support moe_prefill_hit_d2d"
+                "MoE instrumentation schema 1.1 does not support moe_prefill_hit_d2d"
             )
+
+    if config.moe_router_config:
+        if config.moe_backend != "offload":
+            raise ValueError("--moe-router-config requires --moe-backend offload")
+        if config.tp_info.size != 2:
+            raise ValueError("--moe-router-config requires tensor parallel size 2")
+        if instrumentation_is_enabled:
+            raise ValueError(
+                "--moe-router-config cannot be combined with performance instrumentation; "
+                "capture TP2 routes in a separate unmodified run"
+            )
+        if config.moe_cpu_layers:
+            raise ValueError("--moe-router-config cannot be combined with --moe-cpu-layers")
+        override("moe_prefill_overlap", False)
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        logger.info_rank0(
+            "InferenceSystemPlanner Alternative A enabled; CUDA graphs are disabled "
+            "for causal host decisions"
+        )
 
     if is_moe and config.moe_backend == "fused":
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The

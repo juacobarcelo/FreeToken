@@ -257,7 +257,15 @@ class OffloadMoELayer(MoELayer):
         instrumentation = self._instrumentation()
         if instrumentation is not None:
             instrumentation.record_routes(self.layer_id, topk_ids)
-        if ctx.batch.is_prefill:
+        cache = self.offload_cache
+        if cache is not None and cache.causal_router is not None:
+            out = cache.causal_router.forward(
+                layer=self,
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
+        elif ctx.batch.is_prefill:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)

@@ -132,6 +132,9 @@ class OffloadMoeCache:
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
+        # Optional issue-22 adapter. It is attached by the engine only when a
+        # versioned InferenceSystemPlanner router configuration is supplied.
+        self.causal_router = None
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-backend cpu case).

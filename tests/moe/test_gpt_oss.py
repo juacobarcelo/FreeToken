@@ -272,3 +272,99 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
     )
     max_diff = (out_overlap - out_ref).abs().max().item()
     assert torch.equal(out_overlap, out_ref), f"overlap prefill differs; max_diff={max_diff}"
+
+
+@CUDA
+def test_causal_router_preserves_mxfp4_result(tmp_path, tp1):
+    """The optional adapter changes scheduling, not routed expert semantics."""
+
+    pytest.importorskip("inference_system_planner.moe_router")
+    from freetoken.models.gpt_oss.moe import GptOssMxfp4OffloadMoELayer
+    from freetoken.moe.causal_router import AlternativeAAdapter
+    from freetoken.moe.fused_mxfp4 import run_mxfp4_splitk_decode_experts
+
+    dev = torch.device("cuda")
+    config = _tiny_config()
+    cache = _make_offload_cache(config, dev, cache_size=config.num_experts)
+    layer = GptOssMxfp4OffloadMoELayer(config, layer_id=0)
+    layer.offload_cache = cache
+    per_rank_bytes = sum(
+        bank[0].numel() * bank.element_size() for _, bank in cache.banks
+    )
+    aggregate_bytes = 2 * per_rank_bytes
+    router_path = tmp_path / "alternative-a.yaml"
+    router_path.write_text(
+        f"""schema_version: "1.0"
+configuration_id: freetoken-gpu-test
+policy:
+  policy_id: alternative-a-layer-synchronous
+  batch_size: 3
+  microbatch_size: 3
+  synchronization: layer-synchronous
+  waiting_rule: scheduled-resource-completion-only
+  tie_breaks:
+    resident: [ready-token-rows-desc, oldest-reveal-us, layer-id, expert-id]
+    missing: [ready-token-rows-desc, transfer-time-us, oldest-reveal-us, layer-id, expert-id]
+    eviction: [last-used-us, layer-id, expert-id]
+resources:
+  fast_memory_capacity_bytes: {aggregate_bytes * cache.cache_size}
+  activation_reserve_bytes: 0
+  pinned_kv_reserve_bytes: 0
+  initial_resident_experts: []
+  kv_cache_policy: pinned
+  compute_slots: 1
+  pcie_transfer_slots: 1
+costs:
+  default_profile:
+    expert_size: {{value: {aggregate_bytes}, unit: byte, evidence_type: measured, provenance: gpu-test}}
+    h2d_transfer_time: {{value: 1, unit: microsecond, evidence_type: measured, provenance: gpu-test}}
+    compute_fixed_time: {{value: 1, unit: microsecond, evidence_type: measured, provenance: gpu-test}}
+    compute_per_token_row_time: {{value: 1, unit: microsecond-per-token-row, evidence_type: measured, provenance: gpu-test}}
+  overrides: []
+"""
+    )
+    adapter = AlternativeAAdapter(
+        config_path=str(router_path),
+        cache=cache,
+        batch_size=3,
+        tensor_parallel_size=2,
+    )
+
+    torch.manual_seed(71)
+    hidden = 0.1 * torch.randn(3, config.hidden_size, device=dev, dtype=torch.bfloat16)
+    weights = torch.tensor(
+        [[0.6, 0.4], [0.7, 0.3], [0.55, 0.45]],
+        dtype=torch.float32,
+        device=dev,
+    )
+    expert_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 3]], dtype=torch.int32, device=dev
+    )
+
+    def source(name):
+        return cache.bank_sources[name][0].to(dev)
+
+    expected = run_mxfp4_splitk_decode_experts(
+        hidden,
+        weights,
+        expert_ids,
+        source("gate_up_blocks"),
+        source("gate_up_scales"),
+        source("gate_up_bias"),
+        source("down_blocks"),
+        source("down_scales"),
+        source("down_bias"),
+        top_k=config.num_experts_per_tok,
+        hidden_act_alpha=config.hidden_act_alpha,
+        swiglu_limit=config.swiglu_limit,
+    )
+    actual = adapter.forward(
+        layer=layer,
+        hidden_states=hidden,
+        topk_weights=weights,
+        topk_ids=expert_ids,
+    )
+    torch.cuda.synchronize(dev)
+
+    torch.testing.assert_close(actual, expected, rtol=6e-2, atol=6e-2)
+    assert sorted(cache.slot_for_id[0].tolist()) == [0, 1, 2, 3]
