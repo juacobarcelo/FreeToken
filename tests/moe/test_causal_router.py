@@ -118,7 +118,10 @@ def test_routed_forward_delegates_to_adapter_without_changing_arguments(monkeypa
     layer.offload_cache = SimpleNamespace(causal_router=Adapter())
     monkeypatch.setattr(
         "freetoken.layers.moe.get_global_ctx",
-        lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=False)),
+        lambda: SimpleNamespace(
+            batch=SimpleNamespace(is_prefill=False),
+            moe_instrumentation=None,
+        ),
     )
     monkeypatch.setattr(layer, "_maybe_all_reduce", lambda value: value)
     hidden = torch.zeros((2, 8))
