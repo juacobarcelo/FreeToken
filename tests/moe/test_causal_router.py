@@ -75,7 +75,7 @@ def test_adjust_config_rejects_incompatible_router_modes(overrides, message) -> 
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.engine import _adjust_config
 
-    if overrides.get("tp_info") is None:
+    if "tp_info" in overrides and overrides["tp_info"] is None:
         overrides = {**overrides, "tp_info": DistributedInfo(rank=0, size=1)}
     config = _router_config(**overrides)
 
@@ -94,8 +94,13 @@ def test_adjust_config_rejects_router_for_non_gpt_oss() -> None:
 
 
 def test_routed_forward_delegates_to_adapter_without_changing_arguments(monkeypatch) -> None:
+    from freetoken.distributed import DistributedInfo
     from freetoken.layers.moe import OffloadMoELayer
 
+    monkeypatch.setattr(
+        "freetoken.layers.moe.get_tp_info",
+        lambda: DistributedInfo(rank=0, size=1),
+    )
     layer = OffloadMoELayer(
         layer_id=3,
         num_experts=4,
