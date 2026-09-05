@@ -275,17 +275,23 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
 
 
 @CUDA
-def test_causal_router_preserves_mxfp4_result(tmp_path, tp1):
+@pytest.mark.parametrize(("num_tokens", "cache_size"), [(3, 4), (32, 1024)])
+def test_causal_router_preserves_mxfp4_result(
+    tmp_path, tp1, num_tokens, cache_size
+):
     """The optional adapter changes scheduling, not routed expert semantics."""
 
     pytest.importorskip("inference_system_planner.moe_router")
     from freetoken.models.gpt_oss.moe import GptOssMxfp4OffloadMoELayer
     from freetoken.moe.causal_router import AlternativeAAdapter
-    from freetoken.moe.fused_mxfp4 import run_mxfp4_splitk_decode_experts
+    from freetoken.moe.fused_mxfp4 import (
+        run_mxfp4_prefill_experts_t,
+        run_mxfp4_splitk_decode_experts,
+    )
 
     dev = torch.device("cuda:0")
     config = _tiny_config()
-    cache = _make_offload_cache(config, dev, cache_size=config.num_experts)
+    cache = _make_offload_cache(config, dev, cache_size=cache_size)
     layer = GptOssMxfp4OffloadMoELayer(config, layer_id=0)
     layer.offload_cache = cache
     per_rank_bytes = sum(
@@ -298,8 +304,8 @@ def test_causal_router_preserves_mxfp4_result(tmp_path, tp1):
 configuration_id: freetoken-gpu-test
 policy:
   policy_id: alternative-a-layer-synchronous
-  batch_size: 3
-  microbatch_size: 3
+  batch_size: {num_tokens}
+  microbatch_size: {num_tokens}
   synchronization: layer-synchronous
   waiting_rule: scheduled-resource-completion-only
   tie_breaks:
@@ -326,25 +332,40 @@ costs:
     adapter = AlternativeAAdapter(
         config_path=str(router_path),
         cache=cache,
-        batch_size=3,
+        batch_size=num_tokens,
         tensor_parallel_size=2,
     )
 
     torch.manual_seed(71)
-    hidden = 0.1 * torch.randn(3, config.hidden_size, device=dev, dtype=torch.bfloat16)
-    weights = torch.tensor(
-        [[0.6, 0.4], [0.7, 0.3], [0.55, 0.45]],
-        dtype=torch.float32,
-        device=dev,
+    hidden = 0.1 * torch.randn(
+        num_tokens, config.hidden_size, device=dev, dtype=torch.bfloat16
     )
-    expert_ids = torch.tensor(
-        [[0, 1], [1, 2], [2, 3]], dtype=torch.int32, device=dev
-    )
+    if num_tokens == 3:
+        weights = torch.tensor(
+            [[0.6, 0.4], [0.7, 0.3], [0.55, 0.45]],
+            dtype=torch.float32,
+            device=dev,
+        )
+        expert_ids = torch.tensor(
+            [[0, 1], [1, 2], [2, 3]], dtype=torch.int32, device=dev
+        )
+    else:
+        weights = torch.tensor(
+            [[0.6, 0.4]], dtype=torch.float32, device=dev
+        ).repeat(num_tokens, 1)
+        expert_ids = torch.tensor(
+            [[0, 1]], dtype=torch.int32, device=dev
+        ).repeat(num_tokens, 1)
 
     def source(name):
         return cache.bank_sources[name][0].to(dev)
 
-    expected = run_mxfp4_splitk_decode_experts(
+    expected_kernel = (
+        run_mxfp4_splitk_decode_experts
+        if num_tokens <= 16
+        else run_mxfp4_prefill_experts_t
+    )
+    expected = expected_kernel(
         hidden,
         weights,
         expert_ids,
@@ -367,4 +388,8 @@ costs:
     torch.cuda.synchronize(dev)
 
     torch.testing.assert_close(actual, expected, rtol=6e-2, atol=6e-2)
-    assert sorted(cache.slot_for_id[0].tolist()) == [0, 1, 2, 3]
+    expected_residents = sorted(set(expert_ids.flatten().tolist()))
+    actual_residents = sorted(
+        slot for slot in cache.slot_for_id[0].tolist() if slot >= 0
+    )
+    assert actual_residents == list(range(len(expected_residents)))

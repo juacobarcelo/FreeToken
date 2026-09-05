@@ -11,6 +11,8 @@ runs resident demand first, orders missing experts with the planner policy,
 and pipelines one expert transfer ahead of compute. It uses the existing pinned
 host banks, GPU slot cache, copy stream, MXFP4 kernels, and final top-k reduction.
 No future layer route or complete trace crosses the adapter boundary.
+Each scheduled group exposes only its selected cache slot to the MXFP4 kernel;
+the full multi-layer cache is never treated as the kernel's expert axis.
 
 ## Requirements
 

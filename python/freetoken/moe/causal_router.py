@@ -211,11 +211,18 @@ class AlternativeAAdapter:
         group_weights = topk_weights[rows, columns].reshape(-1, 1).contiguous()
         group_slots = torch.full(
             (group.token_row_count, 1),
-            slot_id,
+            0,
             dtype=torch.int32,
             device=self.cache.device,
         )
-        views = self.cache.bank_views()
+        # A plan group contains exactly one expert. Keep the kernel's expert
+        # axis at one instead of exposing the complete slot cache: the grouped
+        # prefill aligner has a bounded expert axis, while a valid offload cache
+        # may contain thousands of slots.
+        views = tuple(
+            bank_cache.narrow(0, slot_id, 1)
+            for _, bank_cache in self.cache.banks
+        )
         gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias = views
         run = (
             run_mxfp4_splitk_decode_experts
