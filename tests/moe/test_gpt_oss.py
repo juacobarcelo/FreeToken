@@ -275,9 +275,12 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
 
 
 @CUDA
-@pytest.mark.parametrize(("num_tokens", "cache_size"), [(3, 4), (32, 1024)])
+@pytest.mark.parametrize(
+    ("num_tokens", "max_running_requests", "cache_size"),
+    [(3, 3, 4), (32, 16, 1024)],
+)
 def test_causal_router_preserves_mxfp4_result(
-    tmp_path, tp1, num_tokens, cache_size
+    tmp_path, tp1, num_tokens, max_running_requests, cache_size
 ):
     """The optional adapter changes scheduling, not routed expert semantics."""
 
@@ -304,8 +307,8 @@ def test_causal_router_preserves_mxfp4_result(
 configuration_id: freetoken-gpu-test
 policy:
   policy_id: alternative-a-layer-synchronous
-  batch_size: {num_tokens}
-  microbatch_size: {num_tokens}
+  batch_size: {max_running_requests}
+  microbatch_size: {max_running_requests}
   synchronization: layer-synchronous
   waiting_rule: scheduled-resource-completion-only
   tie_breaks:
@@ -332,7 +335,7 @@ costs:
     adapter = AlternativeAAdapter(
         config_path=str(router_path),
         cache=cache,
-        batch_size=num_tokens,
+        batch_size=max_running_requests,
         tensor_parallel_size=2,
     )
 
