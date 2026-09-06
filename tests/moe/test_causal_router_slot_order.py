@@ -31,6 +31,9 @@ def implementation(monkeypatch):
     kernel = ModuleType("freetoken.kernel")
     kernel.moe_sum_reduce_triton = lambda partials, output: None
     monkeypatch.setitem(sys.modules, "freetoken.kernel", kernel)
+    helpers = ModuleType("freetoken.moe.fused_mxfp4")
+    helpers.mxfp4_decode_config = lambda **kwargs: {"gate_up_num_splits": 1, "down_num_splits": 1}
+    monkeypatch.setitem(sys.modules, helpers.__name__, helpers)
     return module
 
 
@@ -80,6 +83,12 @@ class Array:
     def fill_(self, value):
         self.data = value
 
+    def sum(self, *, dim):
+        return self
+
+    def to(self, dtype):
+        return self
+
 
 def run_forwards(module, initial_ids, initial_usage, layer_routes, *, legacy):
     adapter = object.__new__(module.AlternativeAAdapter)
@@ -104,7 +113,10 @@ def run_forwards(module, initial_ids, initial_usage, layer_routes, *, legacy):
             self.value = source
             trace.append(("copy", self.slot, source))
 
-    bank = [BankSlot(slot, value) for slot, value in enumerate(initial_ids)]
+    class Bank(list):
+        shape = (len(initial_ids), 32, 64)
+
+    bank = Bank(BankSlot(slot, value) for slot, value in enumerate(initial_ids))
     adapter.cache.banks = [([[layer * experts + expert for expert in range(experts)]
                             for layer in range(4)], bank)]
 
@@ -118,7 +130,7 @@ def run_forwards(module, initial_ids, initial_usage, layer_routes, *, legacy):
 
     adapter.copy_stream = Stream()
     module.torch = SimpleNamespace(
-        empty=lambda *args, **kwargs: None, empty_like=lambda value: value,
+        empty=lambda *args, **kwargs: Array([]), empty_like=lambda value: value,
         cuda=SimpleNamespace(Event=Event, stream=lambda stream: nullcontext()),
     )
 

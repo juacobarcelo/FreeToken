@@ -194,6 +194,72 @@ def test_prefill_configuration_uses_full_forward_geometry_before_expert_grouping
 
 
 @pytest.fixture
+def decode_config_module(monkeypatch):
+    """Use the real geometry selector without importing Torch or GPU packages."""
+    module = ModuleType("freetoken.moe.fused_mxfp4")
+    tree = ast.parse((ROOT / "python/freetoken/moe/fused_mxfp4.py").read_text())
+    tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and
+                 n.name in {"_decode_split_count", "mxfp4_decode_config"}]
+    exec(compile(tree, "fused_mxfp4.py:decode-config", "exec"), module.__dict__)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return module
+
+
+@pytest.mark.parametrize("rows,expected", [(1, (45, 18)), (2, (23, 9))])
+def test_decode_config_differs_from_regrouped_route_count(decode_config_module, rows, expected):
+    config = decode_config_module.mxfp4_decode_config(
+        num_tokens=rows, hidden_size=2880, local_intermediate_size=1440, top_k=4)
+    group = decode_config_module.mxfp4_decode_config(
+        num_tokens=rows, hidden_size=2880, local_intermediate_size=1440, top_k=1)
+    assert (config["gate_up_num_splits"], config["down_num_splits"]) == expected
+    assert group != config  # These shapes expose the old per-group recomputation bug.
+
+
+@pytest.mark.parametrize("rows", [1, 2])
+def test_active_decode_freezes_geometry_and_uses_stock_topk_reduction(
+    methods, decode_config_module, rows,
+):
+    """Run the actual adapter forward across resident and newly loaded groups."""
+    adapter = object.__new__(methods.AlternativeAAdapter)
+    adapter.cache = SimpleNamespace(
+        banks=[([], SimpleNamespace(shape=(4, 1440, 2880)))],
+        usage=[0] * 4, step=SimpleNamespace(fill_=lambda value: None))
+    groups = [SimpleNamespace(expert_id=i) for i in range(4)]
+    prepared = SimpleNamespace(
+        plan=SimpleNamespace(resident_groups=groups[:1], missing_groups=groups[1:]),
+        id_of_slot=[0, -1, -1, -1], usage=[1, 0, 0, 0], step=1,
+        slot_for_layer=[0, -1, -1, -1])
+    adapter.prepare_layer = lambda **kwargs: prepared
+    adapter._schedule_load = lambda **kwargs: (kwargs["expert_id"], None)
+    calls = []
+    adapter._compute_group = lambda **kwargs: calls.append(kwargs)
+    reduction = []
+    output = object()
+
+    class Partials:
+        def sum(self, *, dim):
+            reduction.append(dim)
+            return SimpleNamespace(to=lambda dtype: output)
+
+    partials = Partials()
+    methods.torch.empty = lambda *args, **kwargs: partials
+    hidden = SimpleNamespace(shape=(rows, 2880), dtype="bfloat16", device="cpu")
+    result = adapter.forward(
+        layer=SimpleNamespace(layer_id=0, top_k=4), hidden_states=hidden,
+        topk_weights=object(), topk_ids=SimpleNamespace(shape=(rows, 4)), is_prefill=False)
+    assert result is output and reduction == [1]
+    assert len(calls) == 4
+    config = decode_config_module.mxfp4_decode_config(
+        num_tokens=rows, hidden_size=2880, local_intermediate_size=1440, top_k=4)
+    for call in calls:
+        assert call["decode_config"] == config
+        assert call["decode_config"] is calls[0]["decode_config"]
+        assert call["prefill_config"] is None
+        assert call["partials"] is partials
+        assert call["is_prefill"] is False
+
+
+@pytest.fixture
 def reset_dispatch():
     """Load the actual scheduler admission methods without importing the GPU runtime."""
     source = ast.parse((ROOT / "python/freetoken/scheduler/scheduler.py").read_text())

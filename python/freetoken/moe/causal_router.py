@@ -220,6 +220,7 @@ class AlternativeAAdapter:
         partials: torch.Tensor,
         is_prefill: bool,
         prefill_config: dict[str, int] | None,
+        decode_config: dict[str, int] | None = None,
     ) -> torch.cuda.Event:
         from freetoken.moe.fused_mxfp4 import (
             run_mxfp4_prefill_experts_t,
@@ -251,8 +252,10 @@ class AlternativeAAdapter:
         # Keep its kernel family and arithmetic geometry independent of grouping.
         if is_prefill and prefill_config is None:
             raise ValueError("prefill groups require the original forward's kernel configuration")
+        if not is_prefill and decode_config is None:
+            raise ValueError("decode groups require the original forward's kernel configuration")
         run = run_mxfp4_prefill_experts_t if is_prefill else run_mxfp4_splitk_decode_experts
-        kernel_options = {"kernel_config": prefill_config} if is_prefill else {}
+        kernel_options = {"kernel_config": prefill_config if is_prefill else decode_config}
         observer = diagnostic.observer
         if observer is not None:
             observer.group_begin(rows, columns, group.expert_id, slot_id)
@@ -380,12 +383,21 @@ class AlternativeAAdapter:
         id_of_slot, usage, step = prepared.id_of_slot, prepared.usage, prepared.step
         slot_for_layer = prepared.slot_for_layer
         prefill_config = None
+        decode_config = None
         if is_prefill:
             from freetoken.moe.fused_mxfp4 import mxfp4_prefill_config
 
             prefill_config = mxfp4_prefill_config(
                 num_tokens=hidden_states.shape[0], num_experts=self.cache.num_experts,
                 hidden_size=hidden_states.shape[1],
+                local_intermediate_size=self.cache.banks[0][1].shape[2] // 2,
+                top_k=layer.top_k,
+            )
+        else:
+            from freetoken.moe.fused_mxfp4 import mxfp4_decode_config
+
+            decode_config = mxfp4_decode_config(
+                num_tokens=hidden_states.shape[0], hidden_size=hidden_states.shape[1],
                 local_intermediate_size=self.cache.banks[0][1].shape[2] // 2,
                 top_k=layer.top_k,
             )
@@ -411,6 +423,7 @@ class AlternativeAAdapter:
                 partials=partials,
                 is_prefill=is_prefill,
                 prefill_config=prefill_config,
+                decode_config=decode_config,
             )
             protected_until[slot_id] = done
             step += 1
@@ -437,6 +450,7 @@ class AlternativeAAdapter:
                 partials=partials,
                 is_prefill=is_prefill,
                 prefill_config=prefill_config,
+                decode_config=decode_config,
             )
             protected_until[slot_id] = done
             step += 1
@@ -444,10 +458,15 @@ class AlternativeAAdapter:
             self.cache.usage[slot_id] = step
 
         self.cache.step.fill_(step)
-        from freetoken.kernel import moe_sum_reduce_triton
+        if is_prefill:
+            from freetoken.kernel import moe_sum_reduce_triton
 
-        output = torch.empty_like(hidden_states)
-        moe_sum_reduce_triton(partials, output)
+            output = torch.empty_like(hidden_states)
+            moe_sum_reduce_triton(partials, output)
+        else:
+            # Stock decode reduces the original top-k columns with PyTorch.
+            # Its reduction order can differ from the prefill Triton reducer.
+            output = partials.sum(dim=1).to(hidden_states.dtype)
         if diagnostic.observer is not None:
             diagnostic.observer.placed_partials(partials)
         return output

@@ -77,3 +77,21 @@ The OpenAI chat response retains `chatcmpl-<freetoken-request-uid>` as its id
 and also exposes sampled ids as `choices[0].message.token_ids` (or on the final
 stream choice). This makes an otherwise empty control token identifiable
 without retaining generated text.
+# Exact decode regression prerequisite
+
+InferenceSystemPlanner issue #41 combines the latest admission correction and
+cache-slot optimization, then checks prefill and real decode separately with
+one and two independent requests. Matching final tokens is insufficient.
+
+The active decode path now freezes split-K counts from the complete forward
+before grouping experts and reduces the original top-k columns using the stock
+decode sum. For GPT-OSS-120B TP2, one token with four experts uses gate/up and
+down split counts 45/18; two tokens use 23/9. Each smaller group retains those
+counts. Prefill continues to retain its complete-forward configuration.
+
+`tests/moe/test_gpt_oss.py::test_causal_router_preserves_mxfp4_result` requires
+exact individual partials, their scatter positions and the final output for
+both phases, including one/two-token decode shapes that expose the former
+split-count difference. CPU checks do not qualify a full model for performance;
+the ISP four-case capture, independent comparison and immutable-reference
+receipt must also pass on the actual build before timing it.

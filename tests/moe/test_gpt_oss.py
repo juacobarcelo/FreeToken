@@ -277,11 +277,12 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
 @CUDA
 @pytest.mark.parametrize(
     ("num_tokens", "max_running_requests", "cache_size", "is_prefill", "rare_group"),
-    [(3, 3, 4, False, False), (3, 3, 4, True, False),
+    [(1, 1, 4, False, False), (2, 2, 4, False, False),
+     (3, 3, 4, False, False), (3, 3, 4, True, False),
      (32, 16, 1024, True, False), (32, 16, 1024, True, True)],
 )
 def test_causal_router_preserves_mxfp4_result(
-    tmp_path, tp1, num_tokens, max_running_requests, cache_size, is_prefill, rare_group
+    tmp_path, tp1, monkeypatch, num_tokens, max_running_requests, cache_size, is_prefill, rare_group
 ):
     """The optional adapter changes scheduling, not routed expert semantics."""
 
@@ -295,6 +296,14 @@ def test_causal_router_preserves_mxfp4_result(
 
     dev = torch.device("cuda:0")
     config = _tiny_config()
+    if not is_prefill and num_tokens in (1, 2):
+        from dataclasses import replace
+
+        # Small H/I cap all split counts at the same value and miss the old
+        # regrouping bug. These shapes expose different baseline/group splits,
+        # four-column summation and cache pressure with two logical users.
+        config = replace(config, hidden_size=2048, intermediate_size=1024,
+                         moe_intermediate_size=1024, num_experts=8, num_experts_per_tok=4)
     cache = _make_offload_cache(config, dev, cache_size=cache_size)
     layer = GptOssMxfp4OffloadMoELayer(config, layer_id=0)
     layer.offload_cache = cache
@@ -344,7 +353,13 @@ costs:
     hidden = 0.1 * torch.randn(
         num_tokens, config.hidden_size, device=dev, dtype=torch.bfloat16
     )
-    if num_tokens == 3:
+    if num_tokens in (1, 2):
+        weights = torch.tensor(
+            [[0.4, 0.3, 0.2, 0.1], [0.1, 0.2, 0.3, 0.4]][:num_tokens],
+            dtype=torch.float32, device=dev)
+        expert_ids = torch.tensor(
+            [[0, 1, 2, 3], [2, 3, 4, 5]][:num_tokens], dtype=torch.int32, device=dev)
+    elif num_tokens == 3:
         weights = torch.tensor(
             [[0.6, 0.4], [0.7, 0.3], [0.55, 0.45]],
             dtype=torch.float32,
@@ -369,6 +384,45 @@ costs:
     expected_kernel = (
         run_mxfp4_prefill_experts_t if is_prefill else run_mxfp4_splitk_decode_experts
     )
+    from freetoken.moe import diagnostic
+
+    class Capture:
+        group = None
+        reference_partials = None
+        placed = None
+
+        def __init__(self):
+            self.observed = torch.empty(
+                (num_tokens, config.num_experts_per_tok, config.hidden_size),
+                dtype=hidden.dtype, device=dev)
+            self.coverage = torch.zeros(expert_ids.shape, dtype=torch.int32, device=dev)
+
+        def kernel_begin(self, kind, *args, **kwargs):
+            assert kind == ("prefill" if is_prefill else "decode")
+
+        def kernel_end(self, partials, output):
+            if self.group is None:
+                self.reference_partials = partials.clone()
+            else:
+                rows, columns = self.group
+                # Verify the actual expert output before the one-column helper
+                # reduction and the returned operand later scattered by C.
+                assert torch.equal(partials[:, 0], output)
+                self.observed[rows, columns] = partials[:, 0]
+                self.coverage[rows, columns] += 1
+
+        def group_begin(self, rows, columns, expert_id, slot_id):
+            assert torch.all(expert_ids[rows, columns] == expert_id)
+            self.group = rows, columns
+
+        def group_end(self):
+            self.group = None
+
+        def placed_partials(self, partials):
+            self.placed = partials.clone()
+
+    capture = Capture()
+    monkeypatch.setattr(diagnostic, "observer", capture)
     expected = expected_kernel(
         hidden,
         weights,
@@ -383,6 +437,8 @@ costs:
         hidden_act_alpha=config.hidden_act_alpha,
         swiglu_limit=config.swiglu_limit,
     )
+    expected_partials = capture.reference_partials.clone()
+    monkeypatch.setattr(diagnostic, "observer", None)
     # Issue 36: the real planning boundary may read, but must not mutate operands,
     # cache metadata, scratch buffers or any expert parameter bank.
     state = [hidden, weights, expert_ids, cache.id_of_slot, cache.slot_for_id,
@@ -403,6 +459,7 @@ costs:
         swiglu_limit=config.swiglu_limit,
     )
     assert torch.equal(after_planning, expected)
+    monkeypatch.setattr(diagnostic, "observer", capture)
     actual = adapter.forward(
         layer=layer,
         hidden_states=hidden,
@@ -412,14 +469,12 @@ costs:
     )
     torch.cuda.synchronize(dev)
 
-    if is_prefill:
-        assert torch.equal(actual, expected), (actual - expected).abs().max().item()
-    else:
-        # Decode still has its inherited approximate contract; this correction
-        # targets the actual prompt forward used by the one-next-token experiment.
-        torch.testing.assert_close(actual, expected, rtol=6e-2, atol=6e-2)
+    assert torch.all(capture.coverage == 1)
+    assert torch.equal(capture.observed, expected_partials)
+    assert torch.equal(capture.placed, expected_partials)
+    assert torch.equal(actual, expected), (actual - expected).abs().max().item()
     expected_residents = sorted(set(expert_ids.flatten().tolist()))
     actual_residents = sorted(
         slot for slot in cache.slot_for_id[0].tolist() if slot >= 0
     )
-    assert actual_residents == list(range(len(expected_residents)))
+    assert actual_residents == list(range(min(len(expected_residents), cache_size)))

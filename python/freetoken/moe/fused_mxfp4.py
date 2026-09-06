@@ -226,6 +226,20 @@ def _decode_split_count(routes: int, k_groups: int, target_programs: int) -> int
     return max(1, min(k_groups, -(-target_programs // max(routes, 1))))
 
 
+def mxfp4_decode_config(*, num_tokens: int, hidden_size: int,
+                      local_intermediate_size: int, top_k: int) -> dict[str, int]:
+    """Freeze split-K arithmetic from the complete forward, before expert grouping.
+
+    A route's accumulation boundaries must not change when it moves into a
+    smaller execution group. The ordinary helper uses this same selector.
+    """
+    routes = num_tokens * top_k
+    return {
+        "gate_up_num_splits": _decode_split_count(routes, hidden_size // 32, 180),
+        "down_num_splits": _decode_split_count(routes, local_intermediate_size // 32, 72),
+    }
+
+
 def run_mxfp4_splitk_decode_experts(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -240,6 +254,7 @@ def run_mxfp4_splitk_decode_experts(
     top_k: int,
     hidden_act_alpha: float,
     swiglu_limit: float | None,
+    kernel_config: dict[str, int] | None = None,
 ) -> torch.Tensor:
     """Split-K GEMV MoE decode over TRANSPOSED MXFP4 weights:
     gate_up_blocks_t [E, H//2, 2I], gate_up_scales_t [E, H//32, 2I], bias [E, 2I];
@@ -259,6 +274,14 @@ def run_mxfp4_splitk_decode_experts(
     routes = M * top_k
     device = hidden_states.device
     compute_type = hidden_states.dtype
+    config = (mxfp4_decode_config(
+        num_tokens=M, hidden_size=H,
+        local_intermediate_size=local_intermediate_size, top_k=top_k,
+    ) if kernel_config is None else dict(kernel_config))
+    for key, bound in (("gate_up_num_splits", H // 32),
+                       ("down_num_splits", local_intermediate_size // 32)):
+        if type(config.get(key)) is not int or not 1 <= config[key] <= bound:
+            raise ValueError(f"{key} must be an integer between 1 and {bound}")
 
     route_experts = topk_ids.reshape(-1).to(torch.int64)
     route_weights = topk_weights.reshape(-1).contiguous()
@@ -279,7 +302,7 @@ def run_mxfp4_splitk_decode_experts(
              down_blocks_t, down_scales_t, down_bias),
             routed_x=routed_x, route_experts=route_experts, route_weights=route_weights,
         )
-    gu_splits = _decode_split_count(routes, H // 32, target_programs=180)
+    gu_splits = config["gate_up_num_splits"]
     gate_up_out = mxfp4_splitk_gemv_triton(
         routed_x, gate_up_blocks_t, gate_up_scales_t, gate_up_bias,
         route_experts, N=two_I, K=H, stride_xe=gu_stride_xe, num_splits=gu_splits,
@@ -293,7 +316,7 @@ def run_mxfp4_splitk_decode_experts(
         compute_type=compute_type,
     )
 
-    dp_splits = _decode_split_count(routes, local_intermediate_size // 32, target_programs=72)
+    dp_splits = config["down_num_splits"]
     down_out = mxfp4_splitk_gemv_triton(
         hidden_out, down_blocks_t, down_scales_t, down_bias,
         route_experts, N=H, K=local_intermediate_size,
