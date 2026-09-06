@@ -8,6 +8,7 @@ across the adapter boundary.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,6 +32,13 @@ class PreparedLayer:
     slot_for_layer: list[int]
 
 
+@dataclass
+class LayerSlotOrder:
+    """Private, lazily built eviction order for exactly one layer forward."""
+
+    remaining: Iterator[int] | None = None
+
+
 class AlternativeAAdapter:
     """Apply a resident-first, one-transfer-ahead plan to one visible layer."""
 
@@ -48,12 +56,12 @@ class AlternativeAAdapter:
                 ExpertKey,
                 load_router_config,
                 plan_alternative_a_layer,
-                select_lru_slot,
+                ordered_lru_slots,
             )
         except ImportError as error:
             raise RuntimeError(
                 "--moe-router-config requires the InferenceSystemPlanner package "
-                "from the issue-22 branch"
+                "with the issue-38 ordered_lru_slots API"
             ) from error
 
         config = load_router_config(Path(config_path))
@@ -107,7 +115,7 @@ class AlternativeAAdapter:
         self.cache = cache
         self._ExpertKey = ExpertKey
         self._plan_layer = plan_alternative_a_layer
-        self._select_lru_slot = select_lru_slot
+        self._ordered_lru_slots = ordered_lru_slots
         self.copy_stream = torch.cuda.Stream(device=cache.device)
 
     def _select_victim(
@@ -116,22 +124,21 @@ class AlternativeAAdapter:
         id_of_slot: list[int],
         usage: list[int],
         protected_until: dict[int, torch.cuda.Event],
+        slot_order: LayerSlotOrder,
     ) -> tuple[int, torch.cuda.Event | None]:
-        immediately_safe = [
-            slot_id
-            for slot_id in range(len(id_of_slot))
-            if slot_id not in protected_until
-        ]
-        if immediately_safe:
-            return (
-                self._select_lru_slot(
-                    id_of_slot=id_of_slot,
-                    usage_by_slot=usage,
-                    num_experts=self.cache.num_experts,
-                    candidate_slot_ids=immediately_safe,
-                ),
-                None,
-            )
+        # Build inside the existing victim-selection timing boundary, only when
+        # a load is needed. Host metadata is private to this exclusive forward.
+        # Every changed slot becomes protected before the next load, so the
+        # priority of every remaining unprotected candidate stays unchanged.
+        if slot_order.remaining is None:
+            slot_order.remaining = iter(self._ordered_lru_slots(
+                id_of_slot=id_of_slot,
+                usage_by_slot=usage,
+                num_experts=self.cache.num_experts,
+            ))
+        for slot_id in slot_order.remaining:
+            if slot_id not in protected_until:
+                return slot_id, None
         if not protected_until:
             raise RuntimeError("Alternative A found no evictable expert-cache slot")
         # Every event belongs to the same compute stream and the dict preserves
@@ -149,6 +156,7 @@ class AlternativeAAdapter:
         slot_for_layer: list[int],
         usage: list[int],
         protected_until: dict[int, torch.cuda.Event],
+        slot_order: LayerSlotOrder,
     ) -> tuple[int, torch.cuda.Event]:
         existing_slot = slot_for_layer[expert_id]
         if existing_slot >= 0:
@@ -160,6 +168,7 @@ class AlternativeAAdapter:
             id_of_slot=id_of_slot,
             usage=usage,
             protected_until=protected_until,
+            slot_order=slot_order,
         )
         old_flat_id = id_of_slot[slot_id]
         new_flat_id = layer_id * self.cache.num_experts + expert_id
@@ -387,6 +396,7 @@ class AlternativeAAdapter:
             device=hidden_states.device,
         )
         protected_until: dict[int, torch.cuda.Event] = {}
+        slot_order = LayerSlotOrder()
         for group in plan.resident_groups:
             slot_id = slot_for_layer[group.expert_id]
             if slot_id < 0:
@@ -415,6 +425,7 @@ class AlternativeAAdapter:
                 slot_for_layer=slot_for_layer,
                 usage=usage,
                 protected_until=protected_until,
+                slot_order=slot_order,
             )
             done = self._compute_group(
                 layer=layer,
