@@ -43,8 +43,9 @@ PYTHONPATH=/path/to/inference-system-planner/src python -m pytest -q tests/moe/t
 ```
 
 The optional GPU regression is `tests/moe/test_gpt_oss.py::test_causal_router_preserves_mxfp4_result`.
-It checks planning-only operand/cache immutability and exact baseline output on tiny TP1 fixtures. The active
-prefill cases require exact equality too, including a three-row prompt and a single-row expert group within a
-32-row prompt. Decode retains its pre-existing approximate tolerance; its split counts and intermediate rounding
-are not covered by this prefill correction. These fixtures are not a full-model or TP2 equivalence claim.
-The issue-36 campaign must establish those boundaries separately before interpreting runtime differences.
+It checks planning-only operand/cache immutability and requires exact individual expert partials, their scatter
+positions and final outputs on tiny TP1 fixtures. Prefill includes a three-row prompt and a single-row expert
+group within a 32-row prompt. Decode includes one- and two-token shapes that expose changes in split counts;
+the adapter preserves the complete forward's split configuration and original top-k reduction. These fixtures
+do not establish full-model or TP2 equivalence. The companion issue-41 four-case gate must pass on the same
+executable version before performance measurement.
