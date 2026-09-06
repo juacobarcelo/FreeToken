@@ -388,12 +388,12 @@ costs:
              cache.usage, cache.step, cache.evict_slots, cache.src_indices,
              cache.num_indices, cache.num_missing_full]
     snapshots = [tensor.clone() for tensor in state]
-    parameter_snapshots = [bank.clone() for _, bank in cache.banks]
+    parameter_snapshots = [bank.view(torch.uint8).clone() for _, bank in cache.banks]
     adapter.plan_only(layer=layer, hidden_states=hidden, topk_weights=weights, topk_ids=expert_ids)
     for tensor, snapshot in zip(state, snapshots, strict=True):
         assert torch.equal(tensor, snapshot)
     for (_, bank), snapshot in zip(cache.banks, parameter_snapshots, strict=True):
-        assert torch.equal(bank, snapshot)
+        assert torch.equal(bank.view(torch.uint8), snapshot)
     after_planning = expected_kernel(
         hidden, weights, expert_ids,
         source("gate_up_blocks"), source("gate_up_scales"), source("gate_up_bias"),
