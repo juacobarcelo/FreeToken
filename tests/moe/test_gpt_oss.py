@@ -277,7 +277,7 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
 @CUDA
 @pytest.mark.parametrize(
     ("num_tokens", "max_running_requests", "cache_size", "is_prefill", "rare_group"),
-    [(1, 1, 4, False, False), (2, 2, 4, False, False),
+    [(1, 1, 8, False, False), (2, 2, 8, False, False),
      (3, 3, 4, False, False), (3, 3, 4, True, False),
      (32, 16, 1024, True, False), (32, 16, 1024, True, True)],
 )
@@ -296,7 +296,8 @@ def test_causal_router_preserves_mxfp4_result(
 
     dev = torch.device("cuda:0")
     config = _tiny_config()
-    if not is_prefill and num_tokens in (1, 2):
+    pressured_decode = not is_prefill and num_tokens in (1, 2)
+    if pressured_decode:
         from dataclasses import replace
 
         # Small H/I cap all split counts at the same value and miss the old
@@ -305,6 +306,14 @@ def test_causal_router_preserves_mxfp4_result(
         config = replace(config, hidden_size=2048, intermediate_size=1024,
                          moe_intermediate_size=1024, num_experts=8, num_experts_per_tok=4)
     cache = _make_offload_cache(config, dev, cache_size=cache_size)
+    if pressured_decode:
+        # The real cache requires at least one complete expert layer. Fill that
+        # legal capacity with layer 1 so every layer-0 miss still evicts a bank.
+        cache.materialize_layer(1)
+        cache.copy_missing()
+        torch.cuda.synchronize(dev)
+        assert torch.all(cache.slot_for_id[1] >= 0)
+        assert torch.all(cache.id_of_slot >= config.num_experts)
     layer = GptOssMxfp4OffloadMoELayer(config, layer_id=0)
     layer.offload_cache = cache
     per_rank_bytes = sum(
@@ -474,7 +483,12 @@ costs:
     assert torch.equal(capture.placed, expected_partials)
     assert torch.equal(actual, expected), (actual - expected).abs().max().item()
     expected_residents = sorted(set(expert_ids.flatten().tolist()))
-    actual_residents = sorted(
-        slot for slot in cache.slot_for_id[0].tolist() if slot >= 0
-    )
-    assert actual_residents == list(range(min(len(expected_residents), cache_size)))
+    actual_residents = [
+        expert for expert, slot in enumerate(cache.slot_for_id[0].tolist()) if slot >= 0
+    ]
+    assert actual_residents == expected_residents
+    for expert in expected_residents:
+        slot = int(cache.slot_for_id[0, expert].item())
+        assert int(cache.id_of_slot[slot].item()) == expert
+    if pressured_decode:
+        assert int((cache.slot_for_id[1] == -1).sum().item()) == len(expected_residents)
