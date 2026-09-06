@@ -617,6 +617,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-router-mode",
+        choices=("active", "planning-only"),
+        default=ServerArgs.moe_router_mode,
+        help="Apply the plan, or calculate it and retain stock execution (diagnostic B).",
+    )
+    parser.add_argument(
+        "--router-diagnostic-config",
+        default=ServerArgs.router_diagnostic_config,
+        help="Versioned private experiment seed/reset/capture controls; disabled by default.",
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

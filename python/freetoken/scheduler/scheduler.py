@@ -143,6 +143,17 @@ class Scheduler(SchedulerIOMixin):
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
 
+    def _diagnostic_reset_allowed(
+        self, *, num_pages, moe_cache_size=None, num_mamba_slots=None, num_swa_pages=None,
+    ) -> bool:
+        """Exclusive TP2 diagnostic only; never authorize a general multi-rank resize."""
+        diagnostic = getattr(self.engine, "router_diagnostic", None)
+        return (
+            diagnostic is not None and not diagnostic.armed
+            and self.config.tp_info.size == 2 and num_pages == self.engine.num_pages
+            and all(value is None for value in (moe_cache_size, num_mamba_slots, num_swa_pages))
+        )
+
     @torch.inference_mode()
     def rebuild_cache(
         self,
@@ -158,6 +169,13 @@ class Scheduler(SchedulerIOMixin):
         guarantee the scheduler is idle — no pending prefill, no running decode, no in-flight
         finished requests. All TP ranks must call this with identical arguments.
         """
+        diagnostic = getattr(self.engine, "router_diagnostic", None)
+        if diagnostic is not None and not self._diagnostic_reset_allowed(
+            num_pages=num_pages, moe_cache_size=moe_cache_size,
+            num_mamba_slots=num_mamba_slots, num_swa_pages=num_swa_pages,
+        ):
+            from freetoken.engine.engine import CacheRebuildRejected
+            raise CacheRebuildRejected("diagnostic requires one explicit same-size KV reset per process")
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
         torch.cuda.synchronize(self.device)
@@ -188,6 +206,13 @@ class Scheduler(SchedulerIOMixin):
             min(self.config.max_extend_tokens, _chunk_cap)
             if _chunk_cap else self.config.max_extend_tokens
         )
+        diagnostic = getattr(self.engine, "router_diagnostic", None)
+        if diagnostic is not None:
+            if num_pages != self.engine.num_pages or any(
+                value is not None for value in (moe_cache_size, num_mamba_slots, num_swa_pages)
+            ):
+                raise ValueError("diagnostic reset requires an explicit same-size KV rebuild only")
+            diagnostic.reset()
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
 
@@ -517,6 +542,9 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            diagnostic = getattr(self.engine, "router_diagnostic", None)
+            if diagnostic is not None and diagnostic.capture_active:
+                diagnostic.admit_request(msg.uid, msg.input_ids)
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -554,9 +582,9 @@ class Scheduler(SchedulerIOMixin):
             # accounting barrier for FrontendManager/prepare-stop.
             self._pending_abort_acks.add(msg.uid)
         elif isinstance(msg, CacheRebuildBackendMsg):
-            # v1 scope: only if_idle, single-rank, non-owned-KV. drain mode and TP rebuild
-            # need the drain-gate / all-rank failure-agreement machinery (deferred), so we
-            # reject them cleanly rather than ship hang-prone half-wired paths.
+            # General TP resizing remains unsupported. The exclusive diagnostic
+            # admits only its one same-size reset, with an external process owner
+            # that terminates both ranks on any failure or timeout.
             if not self.cache_manager.supports_runtime_rebuild:
                 self._reply_rebuild(
                     msg.request_id, "unsupported", "this model's cache does not support runtime rebuild"
@@ -565,7 +593,10 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(
                     msg.request_id, "unsupported", f"mode {msg.mode!r} unsupported (use if_idle)"
                 )
-            elif self.config.tp_info.size > 1:
+            elif self.config.tp_info.size > 1 and not self._diagnostic_reset_allowed(
+                num_pages=msg.num_pages, moe_cache_size=msg.moe_cache_size,
+                num_mamba_slots=msg.num_mamba_slots, num_swa_pages=msg.num_swa_pages,
+            ):
                 self._reply_rebuild(
                     msg.request_id, "unsupported", "runtime rebuild unsupported under TP > 1"
                 )

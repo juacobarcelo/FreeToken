@@ -1,5 +1,35 @@
 # Causal expert router adapter
 
+The issue-38 optimization requires an InferenceSystemPlanner revision exporting
+`ordered_lru_slots`. It retains the issue-36 prefill arithmetic correction and
+depends on the companion FreeToken PR #3 before integration into the controlled
+base. See [ISP #38](https://github.com/juacobarcelo/inference-system-planner/issues/38).
+
+Each active layer constructs one private eviction order on its first missing
+expert. Construction stays inside `_select_victim` timing. Later loads consume
+the same order and skip protected slots; when all slots are protected, the
+original first-enqueued event and copy-stream wait are preserved. Remaining
+unprotected IDs and usage cannot change during this exclusive forward. The
+order is discarded at the layer boundary and is never built for resident-only
+or planning-only execution. Learned routes, group order, kernels and cache
+geometry remain unchanged.
+
+The CPU regression executes the real forward, load and victim methods with
+cache and event doubles, comparing slot choices, mapping updates and waits to
+the original one-shot selector over repeated layers:
+
+```bash
+PYTHONPATH=python:/path/to/issue-38-planner/src python -m pytest -q \
+  tests/moe/test_causal_router_slot_order.py \
+  tests/moe/test_router_diagnostic_offline.py \
+  tests/instrumentation/test_records.py tests/test_runtime_layout.py
+```
+
+These tests do not execute CUDA copies or expert arithmetic. Optional GPU tests
+require the pinned FreeToken runtime and supported NVIDIA hardware; the matched
+TP2 full-model diagnostic additionally requires the approved checkpoint and
+experiment resource envelope. No full-model run of this optimization is claimed.
+
 The optional `--moe-router-config` flag connects the bounded Alternative A
 policy from InferenceSystemPlanner issue 22 to FreeToken's existing GPT-OSS
 routed-forward boundary. It is an experiment adapter, not a default serving
@@ -47,3 +77,21 @@ The OpenAI chat response retains `chatcmpl-<freetoken-request-uid>` as its id
 and also exposes sampled ids as `choices[0].message.token_ids` (or on the final
 stream choice). This makes an otherwise empty control token identifiable
 without retaining generated text.
+# Exact decode regression prerequisite
+
+InferenceSystemPlanner issue #41 combines the latest admission correction and
+cache-slot optimization, then checks prefill and real decode separately with
+one and two independent requests. Matching final tokens is insufficient.
+
+The active decode path now freezes split-K counts from the complete forward
+before grouping experts and reduces the original top-k columns using the stock
+decode sum. For GPT-OSS-120B TP2, one token with four experts uses gate/up and
+down split counts 45/18; two tokens use 23/9. Each smaller group retains those
+counts. Prefill continues to retain its complete-forward configuration.
+
+`tests/moe/test_gpt_oss.py::test_causal_router_preserves_mxfp4_result` requires
+exact individual partials, their scatter positions and the final output for
+both phases, including one/two-token decode shapes that expose the former
+split-count difference. CPU checks do not qualify a full model for performance;
+the ISP four-case capture, independent comparison and immutable-reference
+receipt must also pass on the actual build before timing it.

@@ -276,11 +276,13 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
 
 @CUDA
 @pytest.mark.parametrize(
-    ("num_tokens", "max_running_requests", "cache_size"),
-    [(3, 3, 4), (32, 16, 1024)],
+    ("num_tokens", "max_running_requests", "cache_size", "is_prefill", "rare_group"),
+    [(1, 1, 8, False, False), (2, 2, 8, False, False),
+     (3, 3, 4, False, False), (3, 3, 4, True, False),
+     (32, 16, 1024, True, False), (32, 16, 1024, True, True)],
 )
 def test_causal_router_preserves_mxfp4_result(
-    tmp_path, tp1, num_tokens, max_running_requests, cache_size
+    tmp_path, tp1, monkeypatch, num_tokens, max_running_requests, cache_size, is_prefill, rare_group
 ):
     """The optional adapter changes scheduling, not routed expert semantics."""
 
@@ -294,7 +296,24 @@ def test_causal_router_preserves_mxfp4_result(
 
     dev = torch.device("cuda:0")
     config = _tiny_config()
+    pressured_decode = not is_prefill and num_tokens in (1, 2)
+    if pressured_decode:
+        from dataclasses import replace
+
+        # Small H/I cap all split counts at the same value and miss the old
+        # regrouping bug. These shapes expose different baseline/group splits,
+        # four-column summation and cache pressure with two logical users.
+        config = replace(config, hidden_size=2048, intermediate_size=1024,
+                         moe_intermediate_size=1024, num_experts=8, num_experts_per_tok=4)
     cache = _make_offload_cache(config, dev, cache_size=cache_size)
+    if pressured_decode:
+        # The real cache requires at least one complete expert layer. Fill that
+        # legal capacity with layer 1 so every layer-0 miss still evicts a bank.
+        cache.materialize_layer(1)
+        cache.copy_missing()
+        torch.cuda.synchronize(dev)
+        assert torch.all(cache.slot_for_id[1] >= 0)
+        assert torch.all(cache.id_of_slot >= config.num_experts)
     layer = GptOssMxfp4OffloadMoELayer(config, layer_id=0)
     layer.offload_cache = cache
     per_rank_bytes = sum(
@@ -343,7 +362,13 @@ costs:
     hidden = 0.1 * torch.randn(
         num_tokens, config.hidden_size, device=dev, dtype=torch.bfloat16
     )
-    if num_tokens == 3:
+    if num_tokens in (1, 2):
+        weights = torch.tensor(
+            [[0.4, 0.3, 0.2, 0.1], [0.1, 0.2, 0.3, 0.4]][:num_tokens],
+            dtype=torch.float32, device=dev)
+        expert_ids = torch.tensor(
+            [[0, 1, 2, 3], [2, 3, 4, 5]][:num_tokens], dtype=torch.int32, device=dev)
+    elif num_tokens == 3:
         weights = torch.tensor(
             [[0.6, 0.4], [0.7, 0.3], [0.55, 0.45]],
             dtype=torch.float32,
@@ -359,15 +384,54 @@ costs:
         expert_ids = torch.tensor(
             [[0, 1]], dtype=torch.int32, device=dev
         ).repeat(num_tokens, 1)
+        if rare_group:
+            expert_ids[-1, 1] = 2  # one routed row must still use the prefill arithmetic
 
     def source(name):
         return cache.bank_sources[name][0].to(dev)
 
     expected_kernel = (
-        run_mxfp4_splitk_decode_experts
-        if num_tokens <= 16
-        else run_mxfp4_prefill_experts_t
+        run_mxfp4_prefill_experts_t if is_prefill else run_mxfp4_splitk_decode_experts
     )
+    from freetoken.moe import diagnostic
+
+    class Capture:
+        group = None
+        reference_partials = None
+        placed = None
+
+        def __init__(self):
+            self.observed = torch.empty(
+                (num_tokens, config.num_experts_per_tok, config.hidden_size),
+                dtype=hidden.dtype, device=dev)
+            self.coverage = torch.zeros(expert_ids.shape, dtype=torch.int32, device=dev)
+
+        def kernel_begin(self, kind, *args, **kwargs):
+            assert kind == ("prefill" if is_prefill else "decode")
+
+        def kernel_end(self, partials, output):
+            if self.group is None:
+                self.reference_partials = partials.clone()
+            else:
+                rows, columns = self.group
+                # Verify the actual expert output before the one-column helper
+                # reduction and the returned operand later scattered by C.
+                assert torch.equal(partials[:, 0], output)
+                self.observed[rows, columns] = partials[:, 0]
+                self.coverage[rows, columns] += 1
+
+        def group_begin(self, rows, columns, expert_id, slot_id):
+            assert torch.all(expert_ids[rows, columns] == expert_id)
+            self.group = rows, columns
+
+        def group_end(self):
+            self.group = None
+
+        def placed_partials(self, partials):
+            self.placed = partials.clone()
+
+    capture = Capture()
+    monkeypatch.setattr(diagnostic, "observer", capture)
     expected = expected_kernel(
         hidden,
         weights,
@@ -382,17 +446,49 @@ costs:
         hidden_act_alpha=config.hidden_act_alpha,
         swiglu_limit=config.swiglu_limit,
     )
+    expected_partials = capture.reference_partials.clone()
+    monkeypatch.setattr(diagnostic, "observer", None)
+    # Issue 36: the real planning boundary may read, but must not mutate operands,
+    # cache metadata, scratch buffers or any expert parameter bank.
+    state = [hidden, weights, expert_ids, cache.id_of_slot, cache.slot_for_id,
+             cache.usage, cache.step, cache.evict_slots, cache.src_indices,
+             cache.num_indices, cache.num_missing_full]
+    snapshots = [tensor.clone() for tensor in state]
+    parameter_snapshots = [bank.view(torch.uint8).clone() for _, bank in cache.banks]
+    adapter.plan_only(layer=layer, hidden_states=hidden, topk_weights=weights, topk_ids=expert_ids)
+    for tensor, snapshot in zip(state, snapshots, strict=True):
+        assert torch.equal(tensor, snapshot)
+    for (_, bank), snapshot in zip(cache.banks, parameter_snapshots, strict=True):
+        assert torch.equal(bank.view(torch.uint8), snapshot)
+    after_planning = expected_kernel(
+        hidden, weights, expert_ids,
+        source("gate_up_blocks"), source("gate_up_scales"), source("gate_up_bias"),
+        source("down_blocks"), source("down_scales"), source("down_bias"),
+        top_k=config.num_experts_per_tok, hidden_act_alpha=config.hidden_act_alpha,
+        swiglu_limit=config.swiglu_limit,
+    )
+    assert torch.equal(after_planning, expected)
+    monkeypatch.setattr(diagnostic, "observer", capture)
     actual = adapter.forward(
         layer=layer,
         hidden_states=hidden,
         topk_weights=weights,
         topk_ids=expert_ids,
+        is_prefill=is_prefill,
     )
     torch.cuda.synchronize(dev)
 
-    torch.testing.assert_close(actual, expected, rtol=6e-2, atol=6e-2)
+    assert torch.all(capture.coverage == 1)
+    assert torch.equal(capture.observed, expected_partials)
+    assert torch.equal(capture.placed, expected_partials)
+    assert torch.equal(actual, expected), (actual - expected).abs().max().item()
     expected_residents = sorted(set(expert_ids.flatten().tolist()))
-    actual_residents = sorted(
-        slot for slot in cache.slot_for_id[0].tolist() if slot >= 0
-    )
-    assert actual_residents == list(range(len(expected_residents)))
+    actual_residents = [
+        expert for expert, slot in enumerate(cache.slot_for_id[0].tolist()) if slot >= 0
+    ]
+    assert actual_residents == expected_residents
+    for expert in expected_residents:
+        slot = int(cache.slot_for_id[0, expert].item())
+        assert int(cache.id_of_slot[slot].item()) == expert
+    if pressured_decode:
+        assert int((cache.slot_for_id[1] == -1).sum().item()) == len(expected_residents)

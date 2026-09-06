@@ -8,14 +8,35 @@ across the adapter boundary.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.moe import diagnostic
 
 if TYPE_CHECKING:
     from freetoken.layers.moe import OffloadMoELayer
     from freetoken.moe.offload_cache import OffloadMoeCache
+
+
+@dataclass
+class PreparedLayer:
+    """Materialized planning result and private host copies; no cache writes."""
+
+    plan: object
+    id_of_slot: list[int]
+    usage: list[int]
+    step: int
+    slot_for_layer: list[int]
+
+
+@dataclass
+class LayerSlotOrder:
+    """Private, lazily built eviction order for exactly one layer forward."""
+
+    remaining: Iterator[int] | None = None
 
 
 class AlternativeAAdapter:
@@ -35,12 +56,12 @@ class AlternativeAAdapter:
                 ExpertKey,
                 load_router_config,
                 plan_alternative_a_layer,
-                select_lru_slot,
+                ordered_lru_slots,
             )
         except ImportError as error:
             raise RuntimeError(
                 "--moe-router-config requires the InferenceSystemPlanner package "
-                "from the issue-22 branch"
+                "with the issue-38 ordered_lru_slots API"
             ) from error
 
         config = load_router_config(Path(config_path))
@@ -94,7 +115,7 @@ class AlternativeAAdapter:
         self.cache = cache
         self._ExpertKey = ExpertKey
         self._plan_layer = plan_alternative_a_layer
-        self._select_lru_slot = select_lru_slot
+        self._ordered_lru_slots = ordered_lru_slots
         self.copy_stream = torch.cuda.Stream(device=cache.device)
 
     def _select_victim(
@@ -103,22 +124,21 @@ class AlternativeAAdapter:
         id_of_slot: list[int],
         usage: list[int],
         protected_until: dict[int, torch.cuda.Event],
+        slot_order: LayerSlotOrder,
     ) -> tuple[int, torch.cuda.Event | None]:
-        immediately_safe = [
-            slot_id
-            for slot_id in range(len(id_of_slot))
-            if slot_id not in protected_until
-        ]
-        if immediately_safe:
-            return (
-                self._select_lru_slot(
-                    id_of_slot=id_of_slot,
-                    usage_by_slot=usage,
-                    num_experts=self.cache.num_experts,
-                    candidate_slot_ids=immediately_safe,
-                ),
-                None,
-            )
+        # Build inside the existing victim-selection timing boundary, only when
+        # a load is needed. Host metadata is private to this exclusive forward.
+        # Every changed slot becomes protected before the next load, so the
+        # priority of every remaining unprotected candidate stays unchanged.
+        if slot_order.remaining is None:
+            slot_order.remaining = iter(self._ordered_lru_slots(
+                id_of_slot=id_of_slot,
+                usage_by_slot=usage,
+                num_experts=self.cache.num_experts,
+            ))
+        for slot_id in slot_order.remaining:
+            if slot_id not in protected_until:
+                return slot_id, None
         if not protected_until:
             raise RuntimeError("Alternative A found no evictable expert-cache slot")
         # Every event belongs to the same compute stream and the dict preserves
@@ -136,6 +156,7 @@ class AlternativeAAdapter:
         slot_for_layer: list[int],
         usage: list[int],
         protected_until: dict[int, torch.cuda.Event],
+        slot_order: LayerSlotOrder,
     ) -> tuple[int, torch.cuda.Event]:
         existing_slot = slot_for_layer[expert_id]
         if existing_slot >= 0:
@@ -147,6 +168,7 @@ class AlternativeAAdapter:
             id_of_slot=id_of_slot,
             usage=usage,
             protected_until=protected_until,
+            slot_order=slot_order,
         )
         old_flat_id = id_of_slot[slot_id]
         new_flat_id = layer_id * self.cache.num_experts + expert_id
@@ -196,9 +218,11 @@ class AlternativeAAdapter:
         slot_id: int,
         ready: torch.cuda.Event | None,
         partials: torch.Tensor,
+        is_prefill: bool,
+        prefill_config: dict[str, int] | None,
+        decode_config: dict[str, int] | None = None,
     ) -> torch.cuda.Event:
         from freetoken.moe.fused_mxfp4 import (
-            MXFP4_DECODE_MAX_TOKENS,
             run_mxfp4_prefill_experts_t,
             run_mxfp4_splitk_decode_experts,
         )
@@ -224,11 +248,17 @@ class AlternativeAAdapter:
             for _, bank_cache in self.cache.banks
         )
         gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias = views
-        run = (
-            run_mxfp4_splitk_decode_experts
-            if group.token_row_count <= MXFP4_DECODE_MAX_TOKENS
-            else run_mxfp4_prefill_experts_t
-        )
+        # A small expert group is still part of the original prompt forward.
+        # Keep its kernel family and arithmetic geometry independent of grouping.
+        if is_prefill and prefill_config is None:
+            raise ValueError("prefill groups require the original forward's kernel configuration")
+        if not is_prefill and decode_config is None:
+            raise ValueError("decode groups require the original forward's kernel configuration")
+        run = run_mxfp4_prefill_experts_t if is_prefill else run_mxfp4_splitk_decode_experts
+        kernel_options = {"kernel_config": prefill_config if is_prefill else decode_config}
+        observer = diagnostic.observer
+        if observer is not None:
+            observer.group_begin(rows, columns, group.expert_id, slot_id)
         group_output = run(
             group_hidden,
             group_weights,
@@ -242,23 +272,26 @@ class AlternativeAAdapter:
             top_k=1,
             hidden_act_alpha=layer.hidden_act_alpha,
             swiglu_limit=layer.swiglu_limit,
+            **kernel_options,
         )
         # Preserve the model router's original top-k column order. The final
         # reduction therefore uses the same boundary as the unmodified kernel.
         partials[rows, columns] = group_output
+        if observer is not None:
+            observer.group_end()
         done = torch.cuda.Event()
         done.record(compute_stream)
         return done
 
-    def forward(
+    def prepare_layer(
         self,
         *,
         layer: "OffloadMoELayer",
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply one causal layer plan; only ``topk_ids`` from this call are visible."""
+    ) -> PreparedLayer:
+        """Read current metadata and run the real planner without mutating execution state."""
 
         if layer.layer_id < 0 or layer.layer_id >= self.cache.num_layers:
             raise RuntimeError(f"invalid MoE layer id {layer.layer_id}")
@@ -326,12 +359,56 @@ class AlternativeAAdapter:
             transfer_time_us_by_expert=transfer_times,
         )
 
+        return PreparedLayer(plan, id_of_slot, usage, step, slot_for_layer)
+
+    def plan_only(self, **kwargs) -> None:
+        """Perform the same preparation as active execution, then discard its plan."""
+        self.prepare_layer(**kwargs)
+
+    def forward(
+        self,
+        *,
+        layer: "OffloadMoELayer",
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        """Apply the current Alternative A policy; learned expert selection is unchanged."""
+        prepared = self.prepare_layer(
+            layer=layer, hidden_states=hidden_states,
+            topk_weights=topk_weights, topk_ids=topk_ids,
+        )
+        plan = prepared.plan
+        id_of_slot, usage, step = prepared.id_of_slot, prepared.usage, prepared.step
+        slot_for_layer = prepared.slot_for_layer
+        prefill_config = None
+        decode_config = None
+        if is_prefill:
+            from freetoken.moe.fused_mxfp4 import mxfp4_prefill_config
+
+            prefill_config = mxfp4_prefill_config(
+                num_tokens=hidden_states.shape[0], num_experts=self.cache.num_experts,
+                hidden_size=hidden_states.shape[1],
+                local_intermediate_size=self.cache.banks[0][1].shape[2] // 2,
+                top_k=layer.top_k,
+            )
+        else:
+            from freetoken.moe.fused_mxfp4 import mxfp4_decode_config
+
+            decode_config = mxfp4_decode_config(
+                num_tokens=hidden_states.shape[0], hidden_size=hidden_states.shape[1],
+                local_intermediate_size=self.cache.banks[0][1].shape[2] // 2,
+                top_k=layer.top_k,
+            )
+
         partials = torch.empty(
             (hidden_states.shape[0], topk_ids.shape[1], hidden_states.shape[1]),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
         protected_until: dict[int, torch.cuda.Event] = {}
+        slot_order = LayerSlotOrder()
         for group in plan.resident_groups:
             slot_id = slot_for_layer[group.expert_id]
             if slot_id < 0:
@@ -344,6 +421,9 @@ class AlternativeAAdapter:
                 slot_id=slot_id,
                 ready=None,
                 partials=partials,
+                is_prefill=is_prefill,
+                prefill_config=prefill_config,
+                decode_config=decode_config,
             )
             protected_until[slot_id] = done
             step += 1
@@ -358,6 +438,7 @@ class AlternativeAAdapter:
                 slot_for_layer=slot_for_layer,
                 usage=usage,
                 protected_until=protected_until,
+                slot_order=slot_order,
             )
             done = self._compute_group(
                 layer=layer,
@@ -367,6 +448,9 @@ class AlternativeAAdapter:
                 slot_id=slot_id,
                 ready=ready,
                 partials=partials,
+                is_prefill=is_prefill,
+                prefill_config=prefill_config,
+                decode_config=decode_config,
             )
             protected_until[slot_id] = done
             step += 1
@@ -374,10 +458,17 @@ class AlternativeAAdapter:
             self.cache.usage[slot_id] = step
 
         self.cache.step.fill_(step)
-        from freetoken.kernel import moe_sum_reduce_triton
+        if is_prefill:
+            from freetoken.kernel import moe_sum_reduce_triton
 
-        output = torch.empty_like(hidden_states)
-        moe_sum_reduce_triton(partials, output)
+            output = torch.empty_like(hidden_states)
+            moe_sum_reduce_triton(partials, output)
+        else:
+            # Stock decode reduces the original top-k columns with PyTorch.
+            # Its reduction order can differ from the prefill Triton reducer.
+            output = partials.sum(dim=1).to(hidden_states.dtype)
+        if diagnostic.observer is not None:
+            diagnostic.observer.placed_partials(partials)
         return output
 
 
