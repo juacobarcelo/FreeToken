@@ -73,6 +73,19 @@ def dequant_mxfp4_blocks(
     return dequantized.reshape(*blocks.shape[:-2], blocks.shape[-2] * 32).to(out_dtype)
 
 
+def mxfp4_prefill_config(*, num_tokens: int, num_experts: int, hidden_size: int,
+                       local_intermediate_size: int, top_k: int) -> dict[str, int]:
+    """Select arithmetic geometry from the complete serving forward, before grouping."""
+    config = try_get_optimal_moe_config(
+        (num_experts, 2 * local_intermediate_size, hidden_size),
+        (num_experts, hidden_size, local_intermediate_size),
+        top_k, num_tokens,
+    )
+    if config["BLOCK_SIZE_K"] % 32 != 0:
+        config = {**config, "BLOCK_SIZE_K": 64}
+    return config
+
+
 def run_mxfp4_prefill_experts_t(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -87,6 +100,7 @@ def run_mxfp4_prefill_experts_t(
     top_k: int,
     hidden_act_alpha: float,
     swiglu_limit: float | None,
+    kernel_config: dict[str, int] | None = None,
 ) -> torch.Tensor:
     """Prefill experts using the transposed weight layout shared with split-K decode
     ([E, K//2, N] blocks, [E, K//32, N] scales, N innermost). Uses
@@ -110,14 +124,11 @@ def run_mxfp4_prefill_experts_t(
     num_weight_experts = gate_up_blocks_t.shape[0]
     local_intermediate_size = gate_up_blocks_t.shape[2] // 2  # N = 2*I on the last axis
     hidden_size = hidden_states.shape[-1]
-    config = try_get_optimal_moe_config(
-        (num_weight_experts, 2 * local_intermediate_size, hidden_size),
-        (num_weight_experts, hidden_size, local_intermediate_size),
-        top_k,
-        num_tokens,
-    )
-    if config["BLOCK_SIZE_K"] % 32 != 0:
-        config = {**config, "BLOCK_SIZE_K": 64}
+    config = (mxfp4_prefill_config(
+        num_tokens=num_tokens, num_experts=num_weight_experts,
+        hidden_size=hidden_size, local_intermediate_size=local_intermediate_size,
+        top_k=top_k,
+    ) if kernel_config is None else dict(kernel_config))
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids,

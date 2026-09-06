@@ -136,9 +136,11 @@ def test_routed_forward_delegates_to_adapter_without_changing_arguments(monkeypa
     assert calls[0]["hidden_states"] is hidden
     assert calls[0]["topk_weights"] is weights
     assert calls[0]["topk_ids"] is ids
+    assert calls[0]["is_prefill"] is False
 
 
-def test_compute_group_exposes_only_the_selected_cache_slot(monkeypatch) -> None:
+@pytest.mark.parametrize("rows", [1, 17])
+def test_compute_group_preserves_prefill_even_for_one_selected_row(monkeypatch, rows) -> None:
     from freetoken.moe.causal_router import AlternativeAAdapter
 
     class FakeStream:
@@ -174,7 +176,7 @@ def test_compute_group_exposes_only_the_selected_cache_slot(monkeypatch) -> None
         return torch.full_like(hidden, 7)
 
     def unexpected_decode(*args, **kwargs):
-        raise AssertionError("17 routed rows must select the prefill kernel")
+        raise AssertionError("group size must not change the serving forward's phase")
 
     monkeypatch.setattr(
         "freetoken.moe.fused_mxfp4.run_mxfp4_prefill_experts_t",
@@ -186,13 +188,14 @@ def test_compute_group_exposes_only_the_selected_cache_slot(monkeypatch) -> None
     )
 
     occurrences = [
-        SimpleNamespace(token_row=row, topk_column=0) for row in range(17)
+        SimpleNamespace(token_row=row, topk_column=0) for row in range(rows)
     ]
-    group = SimpleNamespace(occurrences=occurrences, token_row_count=17)
+    group = SimpleNamespace(occurrences=occurrences, token_row_count=rows)
     layer = SimpleNamespace(hidden_act_alpha=1.702, swiglu_limit=7.0)
     hidden = torch.zeros((17, 4))
     weights = torch.ones((17, 2))
     partials = torch.zeros((17, 2, 4))
+    config = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32, "GROUP_SIZE_M": 8}
 
     done = adapter._compute_group(
         layer=layer,
@@ -202,18 +205,22 @@ def test_compute_group_exposes_only_the_selected_cache_slot(monkeypatch) -> None
         slot_id=slot_id,
         ready=None,
         partials=partials,
+        is_prefill=True,
+        prefill_config=config,
     )
 
     assert len(calls) == 1
     _, _, ids, views, kwargs = calls[0]
-    assert torch.equal(ids, torch.zeros((17, 1), dtype=torch.int32))
+    assert torch.equal(ids, torch.zeros((rows, 1), dtype=torch.int32))
     assert len(views) == len(bank_caches)
     for view, bank_cache in zip(views, bank_caches, strict=True):
         assert view.shape == (1, 2)
         assert view.is_contiguous()
         assert view.data_ptr() == bank_cache[slot_id].data_ptr()
     assert kwargs["top_k"] == 1
-    assert torch.equal(partials[:, 0], torch.full_like(hidden, 7))
+    assert kwargs["kernel_config"] is config
+    assert torch.equal(partials[:rows, 0], torch.full_like(hidden[:rows], 7))
+    assert torch.count_nonzero(partials[rows:]) == 0
     assert done.recorded_on is stream
 
 

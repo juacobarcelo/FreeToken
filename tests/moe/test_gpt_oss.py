@@ -276,11 +276,12 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
 
 @CUDA
 @pytest.mark.parametrize(
-    ("num_tokens", "max_running_requests", "cache_size"),
-    [(3, 3, 4), (32, 16, 1024)],
+    ("num_tokens", "max_running_requests", "cache_size", "is_prefill", "rare_group"),
+    [(3, 3, 4, False, False), (3, 3, 4, True, False),
+     (32, 16, 1024, True, False), (32, 16, 1024, True, True)],
 )
 def test_causal_router_preserves_mxfp4_result(
-    tmp_path, tp1, num_tokens, max_running_requests, cache_size
+    tmp_path, tp1, num_tokens, max_running_requests, cache_size, is_prefill, rare_group
 ):
     """The optional adapter changes scheduling, not routed expert semantics."""
 
@@ -359,14 +360,14 @@ costs:
         expert_ids = torch.tensor(
             [[0, 1]], dtype=torch.int32, device=dev
         ).repeat(num_tokens, 1)
+        if rare_group:
+            expert_ids[-1, 1] = 2  # one routed row must still use the prefill arithmetic
 
     def source(name):
         return cache.bank_sources[name][0].to(dev)
 
     expected_kernel = (
-        run_mxfp4_splitk_decode_experts
-        if num_tokens <= 16
-        else run_mxfp4_prefill_experts_t
+        run_mxfp4_prefill_experts_t if is_prefill else run_mxfp4_splitk_decode_experts
     )
     expected = expected_kernel(
         hidden,
@@ -407,10 +408,16 @@ costs:
         hidden_states=hidden,
         topk_weights=weights,
         topk_ids=expert_ids,
+        is_prefill=is_prefill,
     )
     torch.cuda.synchronize(dev)
 
-    torch.testing.assert_close(actual, expected, rtol=6e-2, atol=6e-2)
+    if is_prefill:
+        assert torch.equal(actual, expected), (actual - expected).abs().max().item()
+    else:
+        # Decode still has its inherited approximate contract; this correction
+        # targets the actual prompt forward used by the one-next-token experiment.
+        torch.testing.assert_close(actual, expected, rtol=6e-2, atol=6e-2)
     expected_residents = sorted(set(expert_ids.flatten().tolist()))
     actual_residents = sorted(
         slot for slot in cache.slot_for_id[0].tolist() if slot >= 0

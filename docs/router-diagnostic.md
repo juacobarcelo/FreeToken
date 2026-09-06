@@ -6,6 +6,12 @@ They require the matching InferenceSystemPlanner package. Default serving keeps 
 `--moe-router-mode planning-only` requires `--moe-router-config`. It reads the real current route/cache metadata,
 runs the same Python planner as active execution, discards the plan, and invokes the original prefill/decode path.
 The learned top-k selector and all Triton kernels are unchanged. `active` retains the existing Alternative A policy.
+The serving boundary passes its actual prefill/decode phase to the active adapter. During prefill, every expert
+group uses the original forward's kernel family and the configuration selected from the complete token count,
+model expert count and top-k. A group with one or three rows must not silently switch to split-K decode or
+choose a different arithmetic tile. Configuration selection occurs once per layer, before executing its groups.
+This addresses the kernel-family mismatch found alongside a numerical divergence in the first full TP2
+diagnostic. The corrected full-model comparison remains necessary; this change does not claim faster routing.
 
 `--router-diagnostic-config FILE` is an opt-in experiment control, not a public request seed API.
 The companion package validates the frozen GPT-OSS-120B MXFP4 TP2 configuration, seeds both workers,
@@ -26,6 +32,8 @@ PYTHONPATH=/path/to/inference-system-planner/src python -m pytest -q tests/moe/t
 ```
 
 The optional GPU regression is `tests/moe/test_gpt_oss.py::test_causal_router_preserves_mxfp4_result`.
-It additionally checks planning-only operand/cache immutability and exact baseline output on a tiny TP1 fixture.
-Its pre-existing active-path tolerance is not a full-model or TP2 equivalence claim. The issue-36 campaign must
-establish those boundaries separately before interpreting runtime differences.
+It checks planning-only operand/cache immutability and exact baseline output on tiny TP1 fixtures. The active
+prefill cases require exact equality too, including a three-row prompt and a single-row expert group within a
+32-row prompt. Decode retains its pre-existing approximate tolerance; its split counts and intermediate rounding
+are not covered by this prefill correction. These fixtures are not a full-model or TP2 equivalence claim.
+The issue-36 campaign must establish those boundaries separately before interpreting runtime differences.

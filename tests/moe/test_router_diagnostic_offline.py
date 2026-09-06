@@ -164,6 +164,35 @@ def test_A_does_not_prepare_metadata_or_create_a_plan(methods):
     assert all(value.reads == 0 for value in inputs.values() if isinstance(value, Tensor))
 
 
+@pytest.mark.parametrize("prefill", [False, True])
+def test_active_dispatch_passes_the_actual_serving_phase(methods, prefill):
+    adapter, inputs = adapter_fixture(methods)
+    calls = []
+    adapter.forward = lambda **kwargs: (calls.append(kwargs), inputs["hidden_states"])[1]
+    layer = inputs["layer"]
+    layer._instrumentation = lambda: None
+    layer.offload_cache = SimpleNamespace(causal_router=adapter, router_mode="active")
+    layer._maybe_all_reduce = lambda output: output
+    methods.get_global_ctx = lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=prefill))
+    methods.routed_forward(layer, inputs["hidden_states"], inputs["topk_weights"], inputs["topk_ids"])
+    assert len(calls) == 1 and calls[0]["is_prefill"] is prefill
+    assert calls[0]["topk_ids"] is inputs["topk_ids"]
+
+
+def test_prefill_configuration_uses_full_forward_geometry_before_expert_grouping():
+    source = ast.parse((ROOT / "python/freetoken/moe/fused_mxfp4.py").read_text())
+    function = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "mxfp4_prefill_config")
+    calls = []
+    config = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 16, "GROUP_SIZE_M": 8}
+    namespace = {"try_get_optimal_moe_config": lambda *args: (calls.append(args), config)[1]}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "fused_mxfp4.py:config", "exec"), namespace)
+    actual = namespace["mxfp4_prefill_config"](
+        num_tokens=286, num_experts=128, hidden_size=2880, local_intermediate_size=1440, top_k=4)
+    assert calls == [((128, 2880, 2880), (128, 2880, 1440), 4, 286)]
+    assert actual == {**config, "BLOCK_SIZE_K": 64}
+    assert config["BLOCK_SIZE_K"] == 16
+
+
 @pytest.fixture
 def reset_dispatch():
     """Load the actual scheduler admission methods without importing the GPU runtime."""

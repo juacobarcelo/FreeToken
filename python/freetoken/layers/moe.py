@@ -272,6 +272,7 @@ class OffloadMoELayer(MoELayer):
                 hidden_states=hidden_states,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
+                is_prefill=ctx.batch.is_prefill,
             )
         elif ctx.batch.is_prefill:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)

@@ -209,9 +209,10 @@ class AlternativeAAdapter:
         slot_id: int,
         ready: torch.cuda.Event | None,
         partials: torch.Tensor,
+        is_prefill: bool,
+        prefill_config: dict[str, int] | None,
     ) -> torch.cuda.Event:
         from freetoken.moe.fused_mxfp4 import (
-            MXFP4_DECODE_MAX_TOKENS,
             run_mxfp4_prefill_experts_t,
             run_mxfp4_splitk_decode_experts,
         )
@@ -237,11 +238,12 @@ class AlternativeAAdapter:
             for _, bank_cache in self.cache.banks
         )
         gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias = views
-        run = (
-            run_mxfp4_splitk_decode_experts
-            if group.token_row_count <= MXFP4_DECODE_MAX_TOKENS
-            else run_mxfp4_prefill_experts_t
-        )
+        # A small expert group is still part of the original prompt forward.
+        # Keep its kernel family and arithmetic geometry independent of grouping.
+        if is_prefill and prefill_config is None:
+            raise ValueError("prefill groups require the original forward's kernel configuration")
+        run = run_mxfp4_prefill_experts_t if is_prefill else run_mxfp4_splitk_decode_experts
+        kernel_options = {"kernel_config": prefill_config} if is_prefill else {}
         observer = diagnostic.observer
         if observer is not None:
             observer.group_begin(rows, columns, group.expert_id, slot_id)
@@ -258,6 +260,7 @@ class AlternativeAAdapter:
             top_k=1,
             hidden_act_alpha=layer.hidden_act_alpha,
             swiglu_limit=layer.swiglu_limit,
+            **kernel_options,
         )
         # Preserve the model router's original top-k column order. The final
         # reduction therefore uses the same boundary as the unmodified kernel.
@@ -357,6 +360,7 @@ class AlternativeAAdapter:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        is_prefill: bool,
     ) -> torch.Tensor:
         """Apply the current Alternative A policy; learned expert selection is unchanged."""
         prepared = self.prepare_layer(
@@ -366,6 +370,16 @@ class AlternativeAAdapter:
         plan = prepared.plan
         id_of_slot, usage, step = prepared.id_of_slot, prepared.usage, prepared.step
         slot_for_layer = prepared.slot_for_layer
+        prefill_config = None
+        if is_prefill:
+            from freetoken.moe.fused_mxfp4 import mxfp4_prefill_config
+
+            prefill_config = mxfp4_prefill_config(
+                num_tokens=hidden_states.shape[0], num_experts=self.cache.num_experts,
+                hidden_size=hidden_states.shape[1],
+                local_intermediate_size=self.cache.banks[0][1].shape[2] // 2,
+                top_k=layer.top_k,
+            )
 
         partials = torch.empty(
             (hidden_states.shape[0], topk_ids.shape[1], hidden_states.shape[1]),
@@ -385,6 +399,8 @@ class AlternativeAAdapter:
                 slot_id=slot_id,
                 ready=None,
                 partials=partials,
+                is_prefill=is_prefill,
+                prefill_config=prefill_config,
             )
             protected_until[slot_id] = done
             step += 1
@@ -408,6 +424,8 @@ class AlternativeAAdapter:
                 slot_id=slot_id,
                 ready=ready,
                 partials=partials,
+                is_prefill=is_prefill,
+                prefill_config=prefill_config,
             )
             protected_until[slot_id] = done
             step += 1
