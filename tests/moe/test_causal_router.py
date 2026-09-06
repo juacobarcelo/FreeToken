@@ -115,7 +115,7 @@ def test_routed_forward_delegates_to_adapter_without_changing_arguments(monkeypa
             calls.append(kwargs)
             return kwargs["hidden_states"] + 1
 
-    layer.offload_cache = SimpleNamespace(causal_router=Adapter())
+    layer.offload_cache = SimpleNamespace(causal_router=Adapter(), router_mode="active")
     monkeypatch.setattr(
         "freetoken.layers.moe.get_global_ctx",
         lambda: SimpleNamespace(

@@ -298,7 +298,11 @@ class Engine:
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
-        torch.manual_seed(42)
+        if config.router_diagnostic_config:
+            from inference_system_planner.router_diagnostic.runtime import startup_seed
+            torch.manual_seed(startup_seed(config.router_diagnostic_config))
+        else:
+            torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
@@ -434,6 +438,10 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        self.router_diagnostic = None
+        if config.router_diagnostic_config:
+            from inference_system_planner.router_diagnostic.runtime import create_runtime_diagnostic
+            self.router_diagnostic = create_runtime_diagnostic(config.router_diagnostic_config, self)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -595,6 +603,7 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
+        cache.router_mode = config.moe_router_mode
         if config.moe_router_config:
             from freetoken.moe.causal_router import AlternativeAAdapter
 
@@ -898,29 +907,41 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
-        if self.moe_instrumentation is not None:
-            self.moe_instrumentation.begin_forward()
-        with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
-                logits = self.graph_runner.replay(batch)
-            else:
-                logits = self.model.forward()
-        if self.moe_instrumentation is not None:
-            self.moe_instrumentation.finish_forward(batch)
-        if self.cpu_moe_executor is not None:
-            # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
-            # -> stale expert outputs) as a loud error instead of silent corruption.
-            self.cpu_moe_executor.raise_if_unhealthy()
+        diagnostic = getattr(self, "router_diagnostic", None)
+        observing = diagnostic is not None and diagnostic.capture_active
+        if observing:
+            diagnostic.begin_forward(batch, args)
+        try:
+            if self.moe_instrumentation is not None:
+                self.moe_instrumentation.begin_forward()
+            with self.ctx.forward_batch(batch):
+                if self.graph_runner.can_use_cuda_graph(batch):
+                    logits = self.graph_runner.replay(batch)
+                else:
+                    logits = self.model.forward()
+            if self.moe_instrumentation is not None:
+                self.moe_instrumentation.finish_forward(batch)
+            if self.cpu_moe_executor is not None:
+                # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
+                # -> stale expert outputs) as a loud error instead of silent corruption.
+                self.cpu_moe_executor.raise_if_unhealthy()
 
-        for req in batch.reqs:
-            req.complete_one()
+            if observing:
+                diagnostic.model_complete(logits)
+            for req in batch.reqs:
+                req.complete_one()
 
-        batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+            batch_logits = logits[: batch.size]
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+            if observing:
+                diagnostic.end_forward(next_tokens_gpu)
+            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record(self.stream)
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        finally:
+            if observing:
+                diagnostic.clear_forward()
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -980,6 +1001,9 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        diagnostic = getattr(self, "router_diagnostic", None)
+        if diagnostic is not None:
+            diagnostic.close()
         if self.moe_instrumentation is not None:
             self.moe_instrumentation.close()
         self.graph_runner.destroy_cuda_graphs()
@@ -1148,6 +1172,11 @@ def _adjust_config(config: EngineConfig):
         instrumentation_dir,
         instrumentation_run_id,
     )
+    router_mode = getattr(config, "moe_router_mode", "active")
+    if router_mode not in {"active", "planning-only"}:
+        raise ValueError("moe_router_mode must be active or planning-only")
+    if router_mode == "planning-only" and not config.moe_router_config:
+        raise ValueError("planning-only requires --moe-router-config")
     if config.moe_router_config and (
         not is_moe or getattr(model_config, "model_type", None) != "gpt_oss"
     ):

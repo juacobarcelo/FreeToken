@@ -8,14 +8,27 @@ across the adapter boundary.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.moe import diagnostic
 
 if TYPE_CHECKING:
     from freetoken.layers.moe import OffloadMoELayer
     from freetoken.moe.offload_cache import OffloadMoeCache
+
+
+@dataclass
+class PreparedLayer:
+    """Materialized planning result and private host copies; no cache writes."""
+
+    plan: object
+    id_of_slot: list[int]
+    usage: list[int]
+    step: int
+    slot_for_layer: list[int]
 
 
 class AlternativeAAdapter:
@@ -229,6 +242,9 @@ class AlternativeAAdapter:
             if group.token_row_count <= MXFP4_DECODE_MAX_TOKENS
             else run_mxfp4_prefill_experts_t
         )
+        observer = diagnostic.observer
+        if observer is not None:
+            observer.group_begin(rows, columns, group.expert_id, slot_id)
         group_output = run(
             group_hidden,
             group_weights,
@@ -246,19 +262,21 @@ class AlternativeAAdapter:
         # Preserve the model router's original top-k column order. The final
         # reduction therefore uses the same boundary as the unmodified kernel.
         partials[rows, columns] = group_output
+        if observer is not None:
+            observer.group_end()
         done = torch.cuda.Event()
         done.record(compute_stream)
         return done
 
-    def forward(
+    def prepare_layer(
         self,
         *,
         layer: "OffloadMoELayer",
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply one causal layer plan; only ``topk_ids`` from this call are visible."""
+    ) -> PreparedLayer:
+        """Read current metadata and run the real planner without mutating execution state."""
 
         if layer.layer_id < 0 or layer.layer_id >= self.cache.num_layers:
             raise RuntimeError(f"invalid MoE layer id {layer.layer_id}")
@@ -326,6 +344,29 @@ class AlternativeAAdapter:
             transfer_time_us_by_expert=transfer_times,
         )
 
+        return PreparedLayer(plan, id_of_slot, usage, step, slot_for_layer)
+
+    def plan_only(self, **kwargs) -> None:
+        """Perform the same preparation as active execution, then discard its plan."""
+        self.prepare_layer(**kwargs)
+
+    def forward(
+        self,
+        *,
+        layer: "OffloadMoELayer",
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the current Alternative A policy; learned expert selection is unchanged."""
+        prepared = self.prepare_layer(
+            layer=layer, hidden_states=hidden_states,
+            topk_weights=topk_weights, topk_ids=topk_ids,
+        )
+        plan = prepared.plan
+        id_of_slot, usage, step = prepared.id_of_slot, prepared.usage, prepared.step
+        slot_for_layer = prepared.slot_for_layer
+
         partials = torch.empty(
             (hidden_states.shape[0], topk_ids.shape[1], hidden_states.shape[1]),
             dtype=hidden_states.dtype,
@@ -378,6 +419,8 @@ class AlternativeAAdapter:
 
         output = torch.empty_like(hidden_states)
         moe_sum_reduce_triton(partials, output)
+        if diagnostic.observer is not None:
+            diagnostic.observer.placed_partials(partials)
         return output
 
 

@@ -46,6 +46,10 @@ class EngineConfig:
     # Optional InferenceSystemPlanner Alternative A configuration. The adapter is
     # absent by default and loaded lazily only for the controlled GPT-OSS experiment.
     moe_router_config: str | None = None
+    # Planning-only reads the same current metadata and discards the actual plan.
+    moe_router_mode: str = "active"
+    # Private experiment controls; no request-level stochastic seed API.
+    router_diagnostic_config: str | None = None
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

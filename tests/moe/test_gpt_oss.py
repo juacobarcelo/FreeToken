@@ -382,6 +382,26 @@ costs:
         hidden_act_alpha=config.hidden_act_alpha,
         swiglu_limit=config.swiglu_limit,
     )
+    # Issue 36: the real planning boundary may read, but must not mutate operands,
+    # cache metadata, scratch buffers or any expert parameter bank.
+    state = [hidden, weights, expert_ids, cache.id_of_slot, cache.slot_for_id,
+             cache.usage, cache.step, cache.evict_slots, cache.src_indices,
+             cache.num_indices, cache.num_missing_full]
+    snapshots = [tensor.clone() for tensor in state]
+    parameter_snapshots = [bank.clone() for _, bank in cache.banks]
+    adapter.plan_only(layer=layer, hidden_states=hidden, topk_weights=weights, topk_ids=expert_ids)
+    for tensor, snapshot in zip(state, snapshots, strict=True):
+        assert torch.equal(tensor, snapshot)
+    for (_, bank), snapshot in zip(cache.banks, parameter_snapshots, strict=True):
+        assert torch.equal(bank, snapshot)
+    after_planning = expected_kernel(
+        hidden, weights, expert_ids,
+        source("gate_up_blocks"), source("gate_up_scales"), source("gate_up_bias"),
+        source("down_blocks"), source("down_scales"), source("down_bias"),
+        top_k=config.num_experts_per_tok, hidden_act_alpha=config.hidden_act_alpha,
+        swiglu_limit=config.swiglu_limit,
+    )
+    assert torch.equal(after_planning, expected)
     actual = adapter.forward(
         layer=layer,
         hidden_states=hidden,

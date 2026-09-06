@@ -206,10 +206,20 @@ class GptOssMxfp4OffloadMoELayer(OffloadMoELayer):
         assert router_logits is not None
         if not router_logits.is_contiguous():
             router_logits = router_logits.contiguous()
+        from freetoken.moe import diagnostic
+
+        observer = diagnostic.observer
+        if observer is not None:
+            hidden_states, router_logits = observer.layer_input(self, hidden_states, router_logits)
         topk_weights, topk_ids = self._topk(router_logits)
+        if observer is not None:
+            observer.layer_routes(topk_ids, topk_weights)
         # routed_forward dispatches prefill/decode movement and all-reduces once;
         # topk_ids is cloned because decode rewrites it in place into slot ids.
-        return self.routed_forward(hidden_states, topk_weights, topk_ids.clone())
+        output = self.routed_forward(hidden_states, topk_weights, topk_ids.clone())
+        if observer is not None:
+            observer.layer_output(output)
+        return output
 
 
 class GptOssMLP(BaseOP):

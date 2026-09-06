@@ -158,6 +158,14 @@ class Scheduler(SchedulerIOMixin):
         guarantee the scheduler is idle — no pending prefill, no running decode, no in-flight
         finished requests. All TP ranks must call this with identical arguments.
         """
+        diagnostic = getattr(self.engine, "router_diagnostic", None)
+        if diagnostic is not None and (
+            diagnostic.armed or num_pages != self.engine.num_pages or any(
+                value is not None for value in (moe_cache_size, num_mamba_slots, num_swa_pages)
+            )
+        ):
+            from freetoken.engine.engine import CacheRebuildRejected
+            raise CacheRebuildRejected("diagnostic requires one explicit same-size KV reset per process")
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
         torch.cuda.synchronize(self.device)
@@ -188,6 +196,13 @@ class Scheduler(SchedulerIOMixin):
             min(self.config.max_extend_tokens, _chunk_cap)
             if _chunk_cap else self.config.max_extend_tokens
         )
+        diagnostic = getattr(self.engine, "router_diagnostic", None)
+        if diagnostic is not None:
+            if num_pages != self.engine.num_pages or any(
+                value is not None for value in (moe_cache_size, num_mamba_slots, num_swa_pages)
+            ):
+                raise ValueError("diagnostic reset requires an explicit same-size KV rebuild only")
+            diagnostic.reset()
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
 

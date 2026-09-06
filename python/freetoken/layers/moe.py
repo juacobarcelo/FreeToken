@@ -258,8 +258,16 @@ class OffloadMoELayer(MoELayer):
         if instrumentation is not None:
             instrumentation.record_routes(self.layer_id, topk_ids)
         cache = self.offload_cache
-        if cache is not None and cache.causal_router is not None:
-            out = cache.causal_router.forward(
+        adapter = cache.causal_router if cache is not None else None
+        planning_only = adapter is not None and getattr(cache, "router_mode", "active") == "planning-only"
+        if planning_only:
+            # This boundary precedes the stock decode expert-to-slot ID rewrite.
+            adapter.plan_only(
+                layer=self, hidden_states=hidden_states,
+                topk_weights=topk_weights, topk_ids=topk_ids,
+            )
+        if adapter is not None and not planning_only:
+            out = adapter.forward(
                 layer=self,
                 hidden_states=hidden_states,
                 topk_weights=topk_weights,
@@ -269,6 +277,10 @@ class OffloadMoELayer(MoELayer):
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
+        from freetoken.moe import diagnostic
+        observer = diagnostic.observer
+        if observer is not None:
+            observer.local_output(out)
         return self._maybe_all_reduce(out)
 
     def decode_forward(

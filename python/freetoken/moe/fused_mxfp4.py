@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 
 from freetoken.moe.fused import moe_align_block_size, try_get_optimal_moe_config
+from freetoken.moe import diagnostic
 
 # Token-count threshold used by GptOssMxfp4TritonMoELayer.forward to dispatch: batches at
 # or below this bound take the gather decode path (no sort), larger batches take the
@@ -124,6 +125,14 @@ def run_mxfp4_prefill_experts_t(
         num_weight_experts,
     )
 
+    observer = diagnostic.observer
+    if observer is not None:
+        observer.kernel_begin(
+            "prefill", hidden_states, topk_weights, topk_ids,
+            (gate_up_blocks_t, gate_up_scales_t, gate_up_bias,
+             down_blocks_t, down_scales_t, down_bias),
+            alignment=(sorted_token_ids, expert_ids, num_tokens_post_padded, config["BLOCK_SIZE_M"]),
+        )
     gate_up = torch.empty(
         (num_tokens, top_k, 2 * local_intermediate_size),
         device=hidden_states.device,
@@ -183,6 +192,8 @@ def run_mxfp4_prefill_experts_t(
 
     output = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(down, output)
+    if observer is not None:
+        observer.kernel_end(down, output)
     return output
 
 
@@ -249,6 +260,14 @@ def run_mxfp4_splitk_decode_experts(
         routed_x = hidden_states.index_select(0, route_tokens).contiguous()
         gu_stride_xe = routed_x.stride(0)
 
+    observer = diagnostic.observer
+    if observer is not None:
+        observer.kernel_begin(
+            "decode", hidden_states, topk_weights, topk_ids,
+            (gate_up_blocks_t, gate_up_scales_t, gate_up_bias,
+             down_blocks_t, down_scales_t, down_bias),
+            routed_x=routed_x, route_experts=route_experts, route_weights=route_weights,
+        )
     gu_splits = _decode_split_count(routes, H // 32, target_programs=180)
     gate_up_out = mxfp4_splitk_gemv_triton(
         routed_x, gate_up_blocks_t, gate_up_scales_t, gate_up_bias,
@@ -270,7 +289,11 @@ def run_mxfp4_splitk_decode_experts(
         stride_xe=hidden_out.stride(0), num_splits=dp_splits, expert_wts=route_weights,
     )
 
-    return down_out.view(M, top_k, H).sum(dim=1).to(compute_type)
+    partials = down_out.view(M, top_k, H)
+    output = partials.sum(dim=1).to(compute_type)
+    if observer is not None:
+        observer.kernel_end(partials, output)
+    return output
 
 
 __all__ = [
