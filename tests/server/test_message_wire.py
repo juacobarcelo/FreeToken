@@ -67,6 +67,7 @@ def test_user_reply_token_deltas_round_trip():
         finished=False,
         prompt_tokens_delta=11,
         completion_tokens_delta=3,
+        token_ids_delta=(101, 102, 103),
         cached_tokens=4,
         kv_used_pages=40,
         kv_total_pages=512,
@@ -81,6 +82,7 @@ def test_user_reply_token_deltas_round_trip():
     assert decoded.finished is False
     assert decoded.prompt_tokens_delta == 11
     assert decoded.completion_tokens_delta == 3
+    assert decoded.token_ids_delta == (101, 102, 103)
     assert decoded.cached_tokens == 4
     assert decoded.kv_used_pages == 40
     assert decoded.kv_total_pages == 512

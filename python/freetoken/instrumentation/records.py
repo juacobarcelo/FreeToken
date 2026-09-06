@@ -11,8 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
-EVENT_SCHEMA_VERSION = "1.0"
-AGGREGATE_SCHEMA_VERSION = "1.0"
+EVENT_SCHEMA_VERSION = "1.1"
+AGGREGATE_SCHEMA_VERSION = "1.1"
+SUPPORTED_EVENT_SCHEMA_VERSIONS = frozenset({"1.0", EVENT_SCHEMA_VERSION})
 AVAILABILITIES = frozenset({"measured", "unavailable", "unsupported", "not_applicable"})
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -139,8 +140,20 @@ def _validate_compute(value: object, path: str) -> Mapping[str, Any]:
     return item
 
 
+def _validate_tensor_parallel(value: object, path: str) -> Mapping[str, Any]:
+    item = _require_mapping(value, path)
+    rank = _require_int(item.get("rank"), f"{path}.rank")
+    world_size = _require_int(item.get("world_size"), f"{path}.world_size", minimum=1)
+    if rank >= world_size:
+        raise InstrumentationError(f"{path}.rank: must be smaller than world_size")
+    if item.get("route_replication") != "replicated":
+        raise InstrumentationError(f"{path}.route_replication: must be replicated")
+    return item
+
+
 def validate_run_record(record: Mapping[str, Any]) -> None:
-    if record.get("schema_version") != EVENT_SCHEMA_VERSION:
+    schema_version = record.get("schema_version")
+    if schema_version not in SUPPORTED_EVENT_SCHEMA_VERSIONS:
         raise InstrumentationError("run.schema_version: unsupported event schema")
     if record.get("record_type") != "run":
         raise InstrumentationError("run.record_type: must be run")
@@ -158,6 +171,13 @@ def validate_run_record(record: Mapping[str, Any]) -> None:
         raise InstrumentationError("run.execution_mode: must be fused or offload")
     if record.get("sequence_id_namespace") != "freetoken-request-uid":
         raise InstrumentationError("run.sequence_id_namespace: unsupported namespace")
+    if schema_version == "1.0":
+        if "tensor_parallel" in record:
+            raise InstrumentationError(
+                "run.tensor_parallel: schema 1.0 must not declare tensor-parallel metadata"
+            )
+    else:
+        _validate_tensor_parallel(record.get("tensor_parallel"), "run.tensor_parallel")
     model = _require_mapping(record.get("model"), "run.model")
     for field in ("num_moe_layers", "num_experts", "experts_per_token"):
         _require_int(model.get(field), f"run.model.{field}", minimum=1)
@@ -435,7 +455,7 @@ def _validate_layer(
 
 
 def validate_forward_record(record: Mapping[str, Any], run: Mapping[str, Any]) -> None:
-    if record.get("schema_version") != EVENT_SCHEMA_VERSION:
+    if record.get("schema_version") != run.get("schema_version"):
         raise InstrumentationError("forward.schema_version: unsupported event schema")
     if record.get("record_type") != "forward":
         raise InstrumentationError("forward.record_type: must be forward")
@@ -566,7 +586,7 @@ def validate_forward_record(record: Mapping[str, Any], run: Mapping[str, Any]) -
 
 
 def validate_run_end_record(record: Mapping[str, Any], run: Mapping[str, Any]) -> None:
-    if record.get("schema_version") != EVENT_SCHEMA_VERSION:
+    if record.get("schema_version") != run.get("schema_version"):
         raise InstrumentationError("run_end.schema_version: unsupported event schema")
     if record.get("record_type") != "run_end":
         raise InstrumentationError("run_end.record_type: must be run_end")
@@ -794,8 +814,14 @@ def aggregate_records(
     return {
         "schema_version": AGGREGATE_SCHEMA_VERSION,
         "record_type": "aggregate",
-        "event_schema_version": EVENT_SCHEMA_VERSION,
+        "event_schema_version": run["schema_version"],
         "run_id": run["run_id"],
+        "tensor_parallel": dict(
+            run.get(
+                "tensor_parallel",
+                {"rank": 0, "world_size": 1, "route_replication": "replicated"},
+            )
+        ),
         "complete": complete,
         "forward_count": len(forwards),
         "prefill_forward_count": sum(forward["phase"] == "prefill" for forward in forwards),
@@ -838,11 +864,22 @@ class MoeEventWriter:
         execution_mode: str,
         model: Mapping[str, Any],
         expert_cache: Mapping[str, Any],
+        tensor_parallel: Mapping[str, Any] | None = None,
     ) -> None:
         validate_run_id(run_id)
+        tp = dict(
+            tensor_parallel
+            or {"rank": 0, "world_size": 1, "route_replication": "replicated"}
+        )
+        _validate_tensor_parallel(tp, "tensor_parallel")
         output_dir.mkdir(parents=True, exist_ok=True)
-        self.events_path = output_dir / f"{run_id}.events.jsonl"
-        self.aggregate_path = output_dir / f"{run_id}.aggregate.json"
+        rank_suffix = (
+            ""
+            if tp["world_size"] == 1
+            else f".tp-rank-{tp['rank']:02d}-of-{tp['world_size']:02d}"
+        )
+        self.events_path = output_dir / f"{run_id}{rank_suffix}.events.jsonl"
+        self.aggregate_path = output_dir / f"{run_id}{rank_suffix}.aggregate.json"
         if self.aggregate_path.exists():
             raise InstrumentationError(f"refusing to overwrite aggregate: {self.aggregate_path}")
         try:
@@ -865,6 +902,7 @@ class MoeEventWriter:
             "runtime": "freetoken",
             "execution_mode": execution_mode,
             "sequence_id_namespace": "freetoken-request-uid",
+            "tensor_parallel": tp,
             "model": dict(model),
             "expert_cache": dict(expert_cache),
             "clock": {

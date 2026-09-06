@@ -649,6 +649,60 @@ def test_non_stream_chat_usage_omits_details_on_zero_hit():
     assert "prompt_tokens_details" not in response["usage"]
 
 
+def test_non_stream_chat_identifies_empty_one_token_output():
+    state = FakeState(
+        [
+            UserReply(
+                uid=42,
+                incremental_output="",
+                finished=True,
+                completion_tokens_delta=1,
+                token_ids_delta=(200002,),
+            )
+        ]
+    )
+
+    response = run(
+        handle_chat_completion(
+            chat_request(tools=None),
+            request=None,
+            state=state,
+            model_sampling={},
+        )
+    )
+
+    assert response["choices"][0]["message"]["content"] == ""
+    assert response["choices"][0]["message"]["token_ids"] == [200002]
+
+
+def test_stream_chat_identifies_empty_one_token_output():
+    state = FakeState(
+        [
+            UserReply(
+                uid=42,
+                incremental_output="",
+                finished=True,
+                completion_tokens_delta=1,
+                token_ids_delta=(200002,),
+            )
+        ]
+    )
+    req = chat_request(tools=None, stream=True)
+
+    async def collect():
+        return [chunk async for chunk in stream_chat_completion_chunks(42, req, state)]
+
+    events = parse_sse(run(collect()))
+    finish = next(
+        event
+        for event in events
+        if isinstance(event, dict)
+        and event.get("choices")
+        and event["choices"][0].get("finish_reason") is not None
+    )
+    assert finish["choices"][0]["token_ids"] == [200002]
+
+
 def test_stream_chat_usage_chunk_carries_cached_tokens():
     state = FakeState(_cache_hit_replies())
     state.config.enable_cache_report = True

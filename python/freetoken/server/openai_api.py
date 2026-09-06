@@ -203,6 +203,8 @@ async def handle_chat_completion(
     except GenerationError as exc:
         return create_error_response(str(exc), code=exc.code)
     message: dict[str, Any] = {"role": "assistant", "content": result.content}
+    if result.token_ids:
+        message["token_ids"] = list(result.token_ids)
     if result.reasoning:
         message["reasoning_content"] = result.reasoning
     if result.tool_calls:
@@ -357,7 +359,10 @@ async def stream_chat_completion_chunks(
             prompt_tokens = ev.prompt_tokens
             completion_tokens = ev.completion_tokens
             cached_tokens = ev.cached_tokens
-            yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}]))
+            choice = {"delta": {}, "index": 0, "finish_reason": ev.finish_reason}
+            if ev.token_ids:
+                choice["token_ids"] = list(ev.token_ids)
+            yield _sse(_chat_chunk(req, uid, [choice]))
 
     if req.stream_options and req.stream_options.include_usage:
         yield _sse(

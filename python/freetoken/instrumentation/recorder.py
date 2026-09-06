@@ -55,8 +55,10 @@ class MoeInstrumentationRecorder:
                 "MoE instrumentation currently supports the fused and offload backends; "
                 f"resolved backend was {mode!r}"
             )
-        if config.tp_info.size != 1:
-            raise ValueError("MoE instrumentation currently supports tensor-parallel size 1")
+        if config.tp_info.size not in {1, 2}:
+            raise ValueError(
+                "MoE instrumentation currently supports tensor-parallel sizes 1 and 2"
+            )
         output_dir = getattr(config, "moe_instrumentation_dir", None)
         run_id = getattr(config, "moe_instrumentation_run_id", None)
         if not output_dir or not run_id:
@@ -117,6 +119,11 @@ class MoeInstrumentationRecorder:
                 "num_moe_layers": self.num_layers,
                 "num_experts": self.num_experts,
                 "experts_per_token": self.top_k,
+            },
+            "tensor_parallel": {
+                "rank": config.tp_info.rank,
+                "world_size": config.tp_info.size,
+                "route_replication": "replicated",
             },
         }
         if mode == "fused":

@@ -607,6 +607,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-router-config",
+        type=str,
+        default=ServerArgs.moe_router_config,
+        help=(
+            "Enable the bounded InferenceSystemPlanner Alternative A adapter with "
+            "this versioned router YAML. Disabled by default."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

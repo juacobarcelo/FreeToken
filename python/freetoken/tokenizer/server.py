@@ -216,6 +216,7 @@ def tokenize_worker(
                         finish_reason=msg.finish_reason,
                         matched_stop=msg.matched_stop,
                         completion_tokens_delta=1,
+                        token_ids_delta=(msg.next_token,),
                         kv_used_pages=msg.kv_used_pages,
                         kv_total_pages=msg.kv_total_pages,
                         mamba_used_slots=msg.mamba_used_slots,

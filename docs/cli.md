@@ -73,9 +73,12 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 | `--moe-instrumentation-dir` | off | Write opt-in GPT-OSS MoE evidence; requires `--moe-instrumentation-run-id` |
 | `--moe-instrumentation-run-id` | off | Stable, filename-safe id for one evidence stream |
+| `--moe-router-config` | off | Experimental issue-22 Alternative A planner YAML; GPT-OSS offload TP2 only |
 
 See [MoE instrumentation](moe-instrumentation.md) for the supported paths,
-versioned schemas, metric definitions, and timing caveat.
+versioned schemas, metric definitions, and timing caveat. See
+[Causal expert router adapter](causal-router.md) for the experimental adapter's
+strict runtime contract.
 
 ### API behaviour
 

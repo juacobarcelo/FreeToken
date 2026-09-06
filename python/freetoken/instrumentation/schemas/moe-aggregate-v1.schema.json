@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/juacobarcelo/FreeToken/schemas/moe-aggregate-v1.schema.json",
-  "title": "FreeToken MoE instrumentation aggregate schema 1.0",
+  "title": "FreeToken MoE instrumentation aggregate schema 1.1",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -9,6 +9,7 @@
     "record_type",
     "event_schema_version",
     "run_id",
+    "tensor_parallel",
     "complete",
     "forward_count",
     "prefill_forward_count",
@@ -17,10 +18,20 @@
     "source"
   ],
   "properties": {
-    "schema_version": {"const": "1.0"},
+    "schema_version": {"const": "1.1"},
     "record_type": {"const": "aggregate"},
-    "event_schema_version": {"const": "1.0"},
+    "event_schema_version": {"enum": ["1.0", "1.1"]},
     "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "tensor_parallel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rank", "world_size", "route_replication"],
+      "properties": {
+        "rank": {"type": "integer", "minimum": 0},
+        "world_size": {"type": "integer", "minimum": 1},
+        "route_replication": {"const": "replicated"}
+      }
+    },
     "complete": {"type": "boolean"},
     "forward_count": {"type": "integer", "minimum": 0},
     "prefill_forward_count": {"type": "integer", "minimum": 0},
