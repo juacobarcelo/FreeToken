@@ -162,3 +162,54 @@ def test_A_does_not_prepare_metadata_or_create_a_plan(methods):
     methods.get_global_ctx = lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=True))
     methods.routed_forward(layer, inputs["hidden_states"], inputs["topk_weights"], inputs["topk_ids"])
     assert all(value.reads == 0 for value in inputs.values() if isinstance(value, Tensor))
+
+
+@pytest.fixture
+def reset_dispatch():
+    """Load the actual scheduler admission methods without importing the GPU runtime."""
+    source = ast.parse((ROOT / "python/freetoken/scheduler/scheduler.py").read_text())
+    cls = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "Scheduler")
+    names = {"_process_one_msg", "_diagnostic_reset_allowed"}
+    body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert len(body) == 2
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    tree = ast.fix_missing_locations(ast.Module(body=[future, *body], type_ignores=[]))
+    namespace = {name: type(name, (), {}) for name in
+                 ("BatchBackendMsg", "ExitMsg", "UserMsg", "AbortBackendMsg", "CacheRebuildBackendMsg")}
+    exec(compile(tree, "scheduler.py:reset-admission", "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("diagnostic", None), ("ordinary", "unsupported"), ("armed", "unsupported"),
+    ("different-pages", "unsupported"), ("moe", "unsupported"), ("mamba", "unsupported"),
+    ("swa", "unsupported"), ("tp4", "unsupported"), ("busy", "busy"),
+    ("drain", "unsupported"), ("unsupported-cache", "unsupported"),
+])
+def test_actual_TP_reset_admission_is_limited_to_one_idle_same_size_diagnostic(reset_dispatch, case, expected):
+    methods = reset_dispatch
+    diagnostic = None if case == "ordinary" else SimpleNamespace(armed=case == "armed")
+    replies = []
+    scheduler = SimpleNamespace(
+        engine=SimpleNamespace(router_diagnostic=diagnostic, num_pages=8192),
+        config=SimpleNamespace(tp_info=SimpleNamespace(size=4 if case == "tp4" else 2)),
+        cache_manager=SimpleNamespace(supports_runtime_rebuild=case != "unsupported-cache"),
+        prefill_manager=SimpleNamespace(runnable=case == "busy"),
+        decode_manager=SimpleNamespace(runnable=False), _pending_rebuild=None,
+        _reply_rebuild=lambda *args: replies.append(args),
+    )
+    scheduler._diagnostic_reset_allowed = lambda **kw: methods['_diagnostic_reset_allowed'](scheduler, **kw)
+    message = methods['CacheRebuildBackendMsg']()
+    message.request_id = 'reset'
+    message.mode = 'drain' if case == 'drain' else 'if_idle'
+    message.num_pages = 4096 if case == 'different-pages' else 8192
+    message.moe_cache_size = 2395 if case == 'moe' else None
+    message.num_mamba_slots = 1 if case == 'mamba' else None
+    message.num_swa_pages = 8192 if case == 'swa' else None
+    methods['_process_one_msg'](scheduler, message)
+    if expected is None:
+        assert scheduler._pending_rebuild is message
+        assert replies == []
+    else:
+        assert scheduler._pending_rebuild is None
+        assert replies[0][:2] == ('reset', expected)

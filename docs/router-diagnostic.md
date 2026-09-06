@@ -11,6 +11,10 @@ The learned top-k selector and all Triton kernels are unchanged. `active` retain
 The companion package validates the frozen GPT-OSS-120B MXFP4 TP2 configuration, seeds both workers,
 and extends the existing idle cache rebuild with a verified cold expert reset. Exactly one reset and measured
 batch are allowed per process, following a discarded actual-workload warm-up. No cache geometry change is allowed.
+The scheduler's ordinary TP rebuild rejection has a narrow exception for that idle diagnostic reset on TP2.
+It rejects repeated resets, changed capacities, other pool changes, other TP sizes and non-diagnostic serving.
+This does not implement general TP resize recovery: the diagnostic's external owner terminates both workers
+on a failed reset or timeout before any performance sample is accepted.
 Performance mode installs no tensor/timing observer. Separate correctness and cost processes collect bounded evidence;
 a failed or incomplete capture cannot pass the comparison gate. Only isolated replay replaces layer inputs with
 captured baseline values; the A/B/C full-model executions propagate their own results.
