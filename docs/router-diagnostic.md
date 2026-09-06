@@ -11,7 +11,9 @@ group uses the original forward's kernel family and the configuration selected f
 model expert count and top-k. A group with one or three rows must not silently switch to split-K decode or
 choose a different arithmetic tile. Configuration selection occurs once per layer, before executing its groups.
 This addresses the kernel-family mismatch found alongside a numerical divergence in the first full TP2
-diagnostic. The corrected full-model comparison remains necessary; this change does not claim faster routing.
+diagnostic. The corrected one-request campaign passed exact comparison on both ranks, all 36 layers and
+286 prompt positions, with two independent A/B/C repetitions and two isolated replays. Its timing comparison
+was inconclusive under the frozen variation rule; see the companion issue's measured records.
 
 `--router-diagnostic-config FILE` is an opt-in experiment control, not a public request seed API.
 The companion package validates the frozen GPT-OSS-120B MXFP4 TP2 configuration, seeds both workers,
@@ -25,10 +27,19 @@ Performance mode installs no tensor/timing observer. Separate correctness and co
 a failed or incomplete capture cannot pass the comparison gate. Only isolated replay replaces layer inputs with
 captured baseline values; the A/B/C full-model executions propagate their own results.
 
+The observer now binds each runtime UID to its complete CPU prompt immediately before scheduler admission.
+The companion observer checks subsequent chunks against that binding and the actual model input operands.
+The sixteen-request baseline exposed the old prefix-only lookup: a scheduler chunk can contain a prefix
+shared by several frozen prompts. The failed log did not retain that chunk's length or match count; the
+ambiguity is independently reproducible from the frozen inputs. Warmup and performance skip the new observation, and serving chunk sizes
+and request order are preserved. The correction passed offline admission/chunk regression tests; no full-model
+sixteen-request comparison is claimed. Duplicate complete prompts remain explicitly unsupported by this
+diagnostic's identity matching. Install the matching updated companion package with this hook.
+
 The offline protocol tests execute the real preparation/dispatch methods with CPU doubles:
 
 ```bash
-PYTHONPATH=/path/to/inference-system-planner/src python -m pytest -q tests/moe/test_router_diagnostic_offline.py
+PYTHONPATH=/path/to/inference-system-planner/src python -m pytest -q tests/moe/test_router_diagnostic_offline.py tests/scheduler/test_scheduler_diagnostic_admission.py
 ```
 
 The optional GPU regression is `tests/moe/test_gpt_oss.py::test_causal_router_preserves_mxfp4_result`.

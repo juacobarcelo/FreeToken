@@ -542,6 +542,9 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            diagnostic = getattr(self.engine, "router_diagnostic", None)
+            if diagnostic is not None and diagnostic.capture_active:
+                diagnostic.admit_request(msg.uid, msg.input_ids)
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
