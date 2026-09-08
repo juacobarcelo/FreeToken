@@ -618,9 +618,22 @@ def parse_args(
 
     parser.add_argument(
         "--moe-router-mode",
-        choices=("active", "planning-only"),
+        choices=("off", "active", "planning-only"),
         default=ServerArgs.moe_router_mode,
-        help="Apply the plan, or calculate it and retain stock execution (diagnostic B).",
+        help=(
+            "Apply the plan, calculate it and retain stock execution (diagnostic B), or "
+            "start on the stock path with the adapter loaded for a later runtime switch "
+            "(POST /v1/router/mode). Any --moe-router-config needs --cuda-graph-max-bs 0."
+        ),
+    )
+    parser.add_argument(
+        "--moe-router-profile",
+        action="store_true",
+        default=ServerArgs.moe_router_profile,
+        help=(
+            "Diagnostic only: time the router adapter per layer (host planning vs GPU layer "
+            "time) and report it with each /v1/router/mode reply. Adds a sync per layer."
+        ),
     )
     parser.add_argument(
         "--router-diagnostic-config",

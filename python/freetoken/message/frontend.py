@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from .utils import deserialize_type, serialize_type
 
@@ -59,6 +59,17 @@ class UserReply(BaseFrontendMsg):
     # Raw sampled identities. This remains available even when a special/EOS token
     # detokenizes to an empty string, allowing one-token output to be identified.
     token_ids_delta: tuple[int, ...] = ()
+
+
+@dataclass
+class RouterModeReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: result of a /v1/router/mode request.
+    request_id: str
+    status: str  # "ok" | "busy" | "rejected" | "unsupported" | "failed"
+    mode: str = "off"
+    epoch: int = 0
+    error: str | None = None
+    profile: Dict[str, Any] | None = None
 
 
 @dataclass

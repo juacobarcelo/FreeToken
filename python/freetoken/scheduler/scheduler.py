@@ -16,6 +16,8 @@ from freetoken.message import (
     ErrorReplyMsg,
     ExitMsg,
     PromptAdmittedMsg,
+    RouterModeBackendMsg,
+    RouterModeResultMsg,
     UserMsg,
 )
 from freetoken.utils import (
@@ -109,6 +111,9 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        # A received-but-not-yet-applied router-mode switch (RouterModeBackendMsg), run at the
+        # same idle safe point as a rebuild. None when no switch is pending.
+        self._pending_router_mode: RouterModeBackendMsg | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -232,6 +237,7 @@ class Scheduler(SchedulerIOMixin):
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
+            or self._pending_router_mode is not None
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -243,6 +249,10 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        if self._pending_router_mode is not None and last_data is None and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            self._execute_pending_router_mode()
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -277,6 +287,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
+            or self._pending_router_mode is not None
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -288,6 +299,10 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        if self._pending_router_mode is not None and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            self._execute_pending_router_mode()
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -606,6 +621,22 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(msg.request_id, "busy")
             else:
                 self._pending_rebuild = msg
+        elif isinstance(msg, RouterModeBackendMsg):
+            # Same idle contract as a rebuild, but no allocation and no collective: every rank
+            # receives the same message and swaps its own metadata (freetoken.moe.router_mode).
+            if getattr(self.engine, "moe_offload_cache", None) is None:
+                self._reply_router_mode(
+                    msg.request_id, "unsupported", "this model has no MoE offload cache"
+                )
+            elif msg.when != "if_idle":
+                self._reply_router_mode(
+                    msg.request_id, "unsupported", f"when {msg.when!r} unsupported (use if_idle)"
+                )
+            elif self.prefill_manager.runnable or self.decode_manager.runnable:
+                # if_idle: refuse rather than wait, exactly like a rebuild.
+                self._reply_router_mode(msg.request_id, "busy")
+            else:
+                self._pending_router_mode = msg
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -654,6 +685,57 @@ class Scheduler(SchedulerIOMixin):
                 )
             ]
         )
+
+    def _reply_router_mode(self, request_id: str, status: str, error: str | None = None) -> None:
+        from freetoken.moe.router_mode import current_router_mode
+        from freetoken.moe.router_profile import router_profile_snapshot
+
+        # Every reply reports the path actually serving, whatever the status, so the API's
+        # /v1/stats view follows the scheduler rather than an assumed transition. With
+        # --moe-router-profile an "ok" reply also carries (and resets) the timing accumulated
+        # since the previous "ok": a profile therefore covers exactly the blocks served between
+        # two applied switches. A busy/rejected/failed reply must not drain it: the request
+        # is retried and the counters would otherwise be lost mid-block.
+        profile = None
+        if status == "ok":
+            profile = router_profile_snapshot(getattr(self.engine, "_router_adapter", None))
+        self.send_result(
+            [
+                RouterModeResultMsg(
+                    request_id=request_id,
+                    status=status,
+                    mode=current_router_mode(getattr(self.engine, "moe_offload_cache", None)),
+                    epoch=getattr(self.engine, "router_mode_epoch", 0),
+                    error=error,
+                    profile=profile,
+                )
+            ]
+        )
+
+    def _execute_pending_router_mode(self) -> None:
+        from freetoken.moe.router_mode import RouterModeRejected
+
+        msg = self._pending_router_mode
+        assert msg is not None
+        self._pending_router_mode = None
+        try:
+            changed = self.engine.set_router_mode(msg.mode)
+        except RouterModeRejected as e:
+            # Refused before anything was touched -- still serving on the previous path.
+            logger.warning(f"router mode change rejected: {e}")
+            self._reply_router_mode(msg.request_id, "rejected", error=str(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            # The swap or the expert-cache reset failed midway: the slot map is no longer
+            # trusted and, under TP, ranks cannot be re-synchronised one-sidedly. Latch failed.
+            logger.error(f"router mode change failed: {e!r} -- latching failed")
+            self._reply_router_mode(msg.request_id, "failed", error=repr(e))
+            return
+        logger.info_rank0(
+            f"Router mode {'changed to' if changed else 'already'} {msg.mode!r} "
+            f"(epoch {getattr(self.engine, 'router_mode_epoch', 0)})"
+        )
+        self._reply_router_mode(msg.request_id, "ok")
 
     def _execute_pending_rebuild(self) -> None:
         from freetoken.engine.engine import CacheRebuildRejected

@@ -127,6 +127,19 @@ def _swa_page_size(config: Any) -> int:
     return 1
 
 
+def router_state(state: Any) -> dict:
+    """The MoE routing path in service: the scheduler's last /v1/router/mode reply when one
+    exists (every reply reports the path actually serving), else the startup configuration.
+    ``configured`` says whether an adapter was loaded at all (--moe-router-config)."""
+    config = getattr(state, "config", None)
+    configured = bool(getattr(config, "moe_router_config", None))
+    last = getattr(state, "last_router_mode", None)
+    if last is not None:
+        return {"mode": last["mode"], "epoch": int(last["epoch"]), "configured": configured}
+    mode = getattr(config, "moe_router_mode", "off") if configured else "off"
+    return {"mode": mode, "epoch": 0, "configured": configured}
+
+
 def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     """Full /v1/stats doc. throughput is 0 when idle; kv/mamba/swa are null
     when their total is 0 (owned-KV / non-hybrid / non-SWA). kv and swa share one shape:
@@ -158,6 +171,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "mamba": mamba,
         "swa": swa,
         "vram_bytes": tr.vram_bytes,
+        "router": router_state(state),
         "throughput": {
             "decode_tps": round(tr.decode_tps(), 1),
             "prefill_tps": round(tr.prefill_tps(), 1),

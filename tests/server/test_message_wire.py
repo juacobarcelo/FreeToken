@@ -124,3 +124,52 @@ def test_client_dicts_with_the_wire_tag_key_survive_intact():
         assert isinstance(out, TokenizeMsg)
         assert out.chat_template_kwargs == payload
         assert out.tools[0]["function"]["parameters"] == payload
+
+
+def test_router_mode_msg_roundtrip():
+    from freetoken.message import RouterModeMsg
+
+    msg = RouterModeMsg(request_id="m1", mode="active")
+    out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert isinstance(out, RouterModeMsg)
+    assert (out.request_id, out.mode, out.when) == ("m1", "active", "if_idle")
+
+
+def test_router_mode_backend_msg_roundtrip():
+    from freetoken.message import RouterModeBackendMsg
+
+    msg = RouterModeBackendMsg(request_id="m2", mode="planning-only", when="if_idle")
+    out = BaseBackendMsg.decoder(msg.encoder())
+    assert isinstance(out, RouterModeBackendMsg)
+    assert (out.request_id, out.mode, out.when) == ("m2", "planning-only", "if_idle")
+
+
+def test_router_mode_result_msg_roundtrip():
+    from freetoken.message import RouterModeResultMsg
+
+    msg = RouterModeResultMsg(request_id="m3", status="ok", mode="off", epoch=5)
+    out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert isinstance(out, RouterModeResultMsg)
+    assert (out.request_id, out.status, out.mode, out.epoch, out.error) == ("m3", "ok", "off", 5, None)
+
+
+def test_router_mode_reply_roundtrip():
+    from freetoken.message import RouterModeReply
+
+    msg = RouterModeReply(request_id="m4", status="rejected", mode="active", epoch=1, error="graphs")
+    out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
+    assert isinstance(out, RouterModeReply)
+    assert (out.request_id, out.status, out.mode, out.epoch, out.error) == (
+        "m4", "rejected", "active", 1, "graphs",
+    )
+
+
+def test_router_mode_replies_carry_an_optional_profile():
+    from freetoken.message import RouterModeReply, RouterModeResultMsg
+
+    profile = {"schema_version": "1.0", "decode_host_over_gpu": 0.25, "totals": {"decode": {"calls": 2}}}
+    result = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(
+        RouterModeResultMsg(request_id="m5", status="ok", mode="off", epoch=2, profile=profile)))
+    assert result.profile == profile
+    reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(RouterModeReply(request_id="m5", status="ok")))
+    assert reply.profile is None
