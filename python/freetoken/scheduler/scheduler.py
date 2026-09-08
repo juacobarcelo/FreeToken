@@ -692,7 +692,13 @@ class Scheduler(SchedulerIOMixin):
 
         # Every reply reports the path actually serving, whatever the status, so the API's
         # /v1/stats view follows the scheduler rather than an assumed transition. With
-        # --moe-router-profile the reply also carries (and resets) the accumulated timing.
+        # --moe-router-profile an "ok" reply also carries (and resets) the timing accumulated
+        # since the previous "ok": a profile therefore covers exactly the blocks served between
+        # two applied switches. A busy/rejected/failed reply must not drain it: the request
+        # is retried and the counters would otherwise be lost mid-block.
+        profile = None
+        if status == "ok":
+            profile = router_profile_snapshot(getattr(self.engine, "_router_adapter", None))
         self.send_result(
             [
                 RouterModeResultMsg(
@@ -701,7 +707,7 @@ class Scheduler(SchedulerIOMixin):
                     mode=current_router_mode(getattr(self.engine, "moe_offload_cache", None)),
                     epoch=getattr(self.engine, "router_mode_epoch", 0),
                     error=error,
-                    profile=router_profile_snapshot(getattr(self.engine, "_router_adapter", None)),
+                    profile=profile,
                 )
             ]
         )

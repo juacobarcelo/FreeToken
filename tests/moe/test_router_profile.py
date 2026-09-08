@@ -118,3 +118,45 @@ def test_snapshot_helper_only_reports_profiling_adapters():
     proxy = ProfilingRouter(_Adapter(), num_layers=1, events=_Events(1.0), clock=_Clock())
     assert isinstance(proxy.profile, RouterProfile)
     assert router_profile_snapshot(proxy)["schema_version"] == "1.0"
+
+
+def test_scheduler_reply_drains_the_profile_only_on_ok():
+    """``Scheduler._reply_router_mode`` is exercised unbound (the scheduler module needs the
+    CUDA kernel packages): a busy reply while a block drains must leave the counters intact;
+    the applied switch's ``ok`` reply carries them and resets, so one profile spans exactly
+    the blocks between two applied switches."""
+    import ast
+    from pathlib import Path
+
+    from freetoken.message import RouterModeResultMsg
+
+    source = Path(__file__).resolve().parents[2] / "python/freetoken/scheduler/scheduler.py"
+    node = next(
+        n for n in ast.walk(ast.parse(source.read_text()))
+        if isinstance(n, ast.FunctionDef) and n.name == "_reply_router_mode"
+    )
+    namespace: dict = {"RouterModeResultMsg": RouterModeResultMsg}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+    reply = namespace["_reply_router_mode"]
+
+    router = ProfilingRouter(_Adapter(), num_layers=2, events=_Events(0.5), clock=_Clock())
+    router.forward(layer=SimpleNamespace(layer_id=1), is_prefill=False)
+    cache = SimpleNamespace(causal_router=router, router_mode="active")
+    sent: list = []
+    scheduler = SimpleNamespace(
+        engine=SimpleNamespace(moe_offload_cache=cache, router_mode_epoch=4, _router_adapter=router),
+        send_result=lambda messages: sent.extend(messages),
+    )
+
+    reply(scheduler, "req-1", "busy")
+    assert sent[-1].status == "busy" and sent[-1].profile is None
+    assert sent[-1].mode == "active" and sent[-1].epoch == 4
+    assert router.profile.calls["decode"] == [0, 1]  # untouched by the refused request
+
+    reply(scheduler, "req-2", "ok")
+    assert sent[-1].status == "ok"
+    assert sent[-1].profile["totals"]["decode"]["calls"] == 1
+    assert router.profile.calls["decode"] == [0, 0]  # drained exactly once, by the applied switch
+
+    reply(scheduler, "req-3", "ok")
+    assert sent[-1].profile["totals"]["decode"]["calls"] == 0
