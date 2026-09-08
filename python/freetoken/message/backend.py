@@ -53,3 +53,11 @@ class CacheRebuildBackendMsg(BaseBackendMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"  # only "if_idle" is supported; "drain" is deferred (rejected)
+
+
+@dataclass
+class RouterModeBackendMsg(BaseBackendMsg):
+    # tokenizer worker -> scheduler: switch the MoE routing path on an idle engine.
+    request_id: str
+    mode: str  # "off" | "planning-only" | "active"
+    when: str = "if_idle"  # only "if_idle" is supported

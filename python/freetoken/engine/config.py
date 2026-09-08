@@ -46,7 +46,9 @@ class EngineConfig:
     # Optional InferenceSystemPlanner Alternative A configuration. The adapter is
     # absent by default and loaded lazily only for the controlled GPT-OSS experiment.
     moe_router_config: str | None = None
-    # Planning-only reads the same current metadata and discards the actual plan.
+    # Planning-only reads the same current metadata and discards the actual plan. "off"
+    # keeps the stock path while holding the adapter so POST /v1/router/mode can attach
+    # it on an idle engine without a reload (freetoken.moe.router_mode).
     moe_router_mode: str = "active"
     # Private experiment controls; no request-level stochastic seed API.
     router_diagnostic_config: str | None = None

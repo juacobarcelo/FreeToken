@@ -335,6 +335,10 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        # Project router adapter (held even in mode "off") and the count of applied runtime
+        # switches; both stay at their defaults for dense models. See set_router_mode.
+        self._router_adapter = None
+        self.router_mode_epoch = 0
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         from freetoken.instrumentation import instrumentation_enabled
@@ -603,16 +607,21 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
-        cache.router_mode = config.moe_router_mode
         if config.moe_router_config:
             from freetoken.moe.causal_router import AlternativeAAdapter
 
-            cache.causal_router = AlternativeAAdapter(
+            self._router_adapter = AlternativeAAdapter(
                 config_path=config.moe_router_config,
                 cache=cache,
                 batch_size=config.max_running_req,
                 tensor_parallel_size=config.tp_info.size,
             )
+        # The adapter is built whenever a router config is given, even for mode "off", so a
+        # later POST /v1/router/mode can attach it without reloading (set_router_mode).
+        # Without a config there is nothing to switch to and the path is reported as "off".
+        mode = config.moe_router_mode if self._router_adapter is not None else "off"
+        cache.causal_router = self._router_adapter if mode != "off" else None
+        cache.router_mode = mode
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -746,6 +755,27 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
     @torch.inference_mode()
+    def set_router_mode(self, mode: str) -> bool:
+        """Idle-only swap between the stock offload path and the project router (see
+        freetoken.moe.router_mode). Touches neither weights, KV pages nor graphs -- every
+        router mode runs eagerly -- and restarts the expert cache cold so both paths begin
+        from the same residency. The caller (scheduler) must guarantee no in-flight
+        prefill/decode; all TP ranks must call this with identical arguments. Returns True
+        when the path changed (and the epoch advanced)."""
+        from freetoken.moe.router_mode import apply_router_mode
+
+        changed = apply_router_mode(
+            self.moe_offload_cache,
+            self._router_adapter,
+            mode,
+            graphs_active=self.graph_runner.max_graph_bs > 0,
+            synchronize=lambda: torch.cuda.synchronize(self.device),
+        )
+        if changed:
+            self.router_mode_epoch += 1
+        return changed
+
+    @torch.inference_mode()
     def rebuild_runtime_cache(
         self,
         *,
@@ -771,10 +801,15 @@ class Engine:
         if (
             moe_cache_size is not None
             and self.moe_offload_cache is not None
-            and self.moe_offload_cache.causal_router is not None
+            and (
+                self.moe_offload_cache.causal_router is not None
+                or self._router_adapter is not None
+            )
         ):
+            # The adapter validated its capacity against the slot count at startup; a resize
+            # would silently invalidate it even while the mode is "off".
             raise CacheRebuildRejected(
-                "moe_cache_size cannot change while the causal router is attached; "
+                "moe_cache_size cannot change while a causal router adapter is loaded; "
                 "restart with a matching versioned router configuration"
             )
 
@@ -1172,11 +1207,14 @@ def _adjust_config(config: EngineConfig):
         instrumentation_dir,
         instrumentation_run_id,
     )
-    router_mode = getattr(config, "moe_router_mode", "active")
-    if router_mode not in {"active", "planning-only"}:
-        raise ValueError("moe_router_mode must be active or planning-only")
-    if router_mode == "planning-only" and not config.moe_router_config:
-        raise ValueError("planning-only requires --moe-router-config")
+    from freetoken.moe.router_mode import validate_router_mode
+
+    validate_router_mode(
+        getattr(config, "moe_router_mode", "active"),
+        router_config=config.moe_router_config,
+        cuda_graph_bs=config.cuda_graph_bs,
+        cuda_graph_max_bs=config.cuda_graph_max_bs,
+    )
     if config.moe_router_config and (
         not is_moe or getattr(model_config, "model_type", None) != "gpt_oss"
     ):

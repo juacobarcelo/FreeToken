@@ -62,6 +62,16 @@ class UserReply(BaseFrontendMsg):
 
 
 @dataclass
+class RouterModeReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: result of a /v1/router/mode request.
+    request_id: str
+    status: str  # "ok" | "busy" | "rejected" | "unsupported" | "failed"
+    mode: str = "off"
+    epoch: int = 0
+    error: str | None = None
+
+
+@dataclass
 class CacheRebuildReply(BaseFrontendMsg):
     # detokenizer worker -> api server: result of a /v1/cache/rebuild request.
     request_id: str

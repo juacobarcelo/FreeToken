@@ -103,6 +103,24 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class RouterModeMsg(BaseTokenizerMsg):
+    # api server -> tokenizer worker (pure passthrough to RouterModeBackendMsg).
+    request_id: str
+    mode: str  # "off" | "planning-only" | "active"
+    when: str = "if_idle"
+
+
+@dataclass
+class RouterModeResultMsg(BaseTokenizerMsg):
+    # scheduler -> detokenizer worker (passthrough to RouterModeReply).
+    request_id: str
+    status: str  # "ok" | "busy" | "rejected" | "unsupported" | "failed"
+    mode: str = "off"  # the path now serving, whatever the status
+    epoch: int = 0  # advances once per applied change; unchanged on no-op or refusal
+    error: str | None = None
+
+
+@dataclass
 class ErrorReplyMsg(BaseTokenizerMsg):
     # scheduler -> tokenizer/detokenizer worker -> frontend: a request the scheduler cannot
     # serve (e.g. its prompt exceeds the KV budget). The worker translates it into a terminal

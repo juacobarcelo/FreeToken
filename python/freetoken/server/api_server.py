@@ -24,6 +24,8 @@ from freetoken.message import (
     BatchFrontendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
+    RouterModeMsg,
+    RouterModeReply,
     TokenizeMsg,
     UserReply,
 )
@@ -148,6 +150,11 @@ class FrontendManager:
     # "rebuilding"/"failed" for runtime cache rebuilds.
     maintenance_state: str = "loading"
     last_rebuild: Dict[str, Any] | None = None
+    # Last /v1/router/mode reply {request_id, status, mode, epoch, error}: the scheduler's own
+    # report of the routing path it serves. None until the first reply (stats fall back to the
+    # startup configuration). Its waiter lives in rebuild_futures so the crash watchdog's
+    # fail_pending_rebuilds wakes it too.
+    last_router_mode: Dict[str, Any] | None = None
     load_progress: Any = None
     # Monotonic timestamp the server became ready; drives /health + /v1/stats uptime without
     # being affected by wall-clock adjustments.
@@ -244,6 +251,9 @@ class FrontendManager:
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
                 continue
+            if isinstance(msg, RouterModeReply):
+                self._resolve_router_mode(msg)
+                continue
             for msg in _unwrap_msg(msg):
                 # Global accounting follows actual admitted/sampled work even after the HTTP
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
@@ -282,6 +292,26 @@ class FrontendManager:
             fut.set_result(self.last_rebuild)
         if self.fatal_error is not None:
             # A dead backend stays failed regardless of any (possibly stale/buffered) reply.
+            self.maintenance_state = "failed"
+            return
+        self.maintenance_state = "failed" if msg.status == "failed" else "serving"
+
+    def _resolve_router_mode(self, msg: RouterModeReply) -> None:
+        """Terminal transition for a router-mode switch. Same gate rules as _resolve_rebuild:
+        the switch shares the "rebuilding" maintenance state (generation is refused while the
+        path is being swapped) and only a genuine "failed" latches; ok/busy/rejected/unsupported
+        leave the previous path serving. A fatal worker death outranks any late reply."""
+        self.last_router_mode = {
+            "request_id": msg.request_id,
+            "status": msg.status,
+            "mode": msg.mode,
+            "epoch": msg.epoch,
+            "error": msg.error,
+        }
+        fut = self.rebuild_futures.pop(msg.request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(self.last_router_mode)
+        if self.fatal_error is not None:
             self.maintenance_state = "failed"
             return
         self.maintenance_state = "failed" if msg.status == "failed" else "serving"
@@ -544,6 +574,74 @@ async def dispatch_rebuild(
         return {"status": "timeout", "request_id": request_id}
 
 
+class RouterModeRequest(BaseModel):
+    # The MoE routing path to serve: the stock offload path ("off"), the project router
+    # planning but not applying ("planning-only"), or applying its plan ("active"). The
+    # adapter itself must have been loaded at startup (--moe-router-config).
+    mode: Literal["off", "planning-only", "active"]
+    # Only "if_idle" (refuse unless the scheduler is idle) is implemented; the Literal makes
+    # anything else a 422 at the API layer, like CacheRebuildRequest.mode.
+    when: Literal["if_idle"] = "if_idle"
+    timeout: float = 120.0
+
+
+async def dispatch_router_mode(
+    state: FrontendManager,
+    *,
+    mode: str,
+    when: str = "if_idle",
+    timeout: float = 120.0,
+) -> Dict[str, Any]:
+    """Send a router-mode switch to the scheduler and await its result, managing the same
+    maintenance gate as dispatch_rebuild (generation is refused while the path is swapped).
+    Returns the scheduler's result dict, or a synthesized ``{"status": "failed"|"timeout"}``
+    on dispatch error / timeout."""
+    request_id = str(uuid.uuid4())
+    fut = asyncio.get_running_loop().create_future()
+    state.rebuild_futures[request_id] = fut
+    state.maintenance_state = "rebuilding"
+    try:
+        await state.send_one(RouterModeMsg(request_id=request_id, mode=mode, when=when))
+    except Exception as e:  # noqa: BLE001
+        # Never reached the scheduler: the path is untouched, reopen the gate (see
+        # dispatch_rebuild for why a latched gate with no reply coming would wedge the server).
+        state.rebuild_futures.pop(request_id, None)
+        state.maintenance_state = "serving"
+        return {"status": "failed", "error": f"failed to dispatch router mode: {e!r}"}
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        # Keep the gate closed: the scheduler may still be draining toward the idle point and
+        # will apply the switch; its reply reopens the gate via _resolve_router_mode.
+        state.rebuild_futures.pop(request_id, None)
+        return {"status": "timeout", "request_id": request_id}
+
+
+def _maintenance_precheck(state: FrontendManager) -> JSONResponse | None:
+    """The 503/409 short-circuits shared by the two idle-only control endpoints."""
+    if state.maintenance_state == "loading":
+        return JSONResponse(
+            {"status": "loading", "error": "model is still loading; cannot change the engine yet"},
+            status_code=503,
+        )
+    if state.maintenance_state == "failed":
+        return JSONResponse(
+            {"status": "failed", "error": "server latched in maintenance; restart required"},
+            status_code=503,
+        )
+    if state.maintenance_state == "rebuilding":
+        return JSONResponse(
+            {"status": "busy", "error": "a cache rebuild or router-mode switch is already in progress"},
+            status_code=409,
+        )
+    if state.maintenance_state == "stopping":
+        return JSONResponse(
+            {"status": "busy", "error": "engine stop is in progress"},
+            status_code=409,
+        )
+    return None
+
+
 def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> int | None:
     """External accepts num_swa_pages OR swa_full_tokens_ratio; internally only num_swa_pages
     flows. Convert a ratio to an absolute window at the requested (or current) full anchor, in the
@@ -569,26 +667,9 @@ async def cache_rebuild(req: CacheRebuildRequest):
     """Trigger a runtime KV/MoE cache resize. Blocks until the scheduler reports a result
     (or timeout). New generation is gated (503) while a rebuild is in flight."""
     state = get_global_state()
-    if state.maintenance_state == "loading":
-        return JSONResponse(
-            {"status": "loading", "error": "model is still loading; cannot rebuild cache yet"},
-            status_code=503,
-        )
-    if state.maintenance_state == "failed":
-        return JSONResponse(
-            {"status": "failed", "error": "server latched in maintenance; restart required"},
-            status_code=503,
-        )
-    if state.maintenance_state == "rebuilding":
-        return JSONResponse(
-            {"status": "busy", "error": "a cache rebuild is already in progress"},
-            status_code=409,
-        )
-    if state.maintenance_state == "stopping":
-        return JSONResponse(
-            {"status": "busy", "error": "engine stop is in progress"},
-            status_code=409,
-        )
+    gate = _maintenance_precheck(state)
+    if gate is not None:
+        return gate
     if req.num_swa_pages is not None and req.swa_full_tokens_ratio is not None:
         return JSONResponse(
             {"status": "failed", "error": "pass num_swa_pages OR swa_full_tokens_ratio, not both"},
@@ -610,6 +691,34 @@ async def cache_rebuild(req: CacheRebuildRequest):
     )
     if result["status"] == "timeout":
         return JSONResponse(result, status_code=504)
+    return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
+
+
+@app.get("/v1/router/mode")
+async def router_mode_get():
+    """The MoE routing path the engine serves and how many runtime switches it has applied."""
+    from .stats import router_state
+
+    return router_state(get_global_state())
+
+
+@app.post("/v1/router/mode")
+async def router_mode_set(req: RouterModeRequest):
+    """Switch the MoE routing path (stock offload / project router planning-only / active) on
+    an idle engine without reloading anything. Blocks until the scheduler reports a result (or
+    timeout); generation is gated (503) while the switch is in flight, like a cache rebuild.
+    The reply carries the path now serving and its epoch: "busy" means retry once idle,
+    "rejected" means the request cannot apply on this server (no adapter loaded, CUDA graphs
+    captured), "ok" with an unchanged epoch means the path was already the one requested."""
+    state = get_global_state()
+    gate = _maintenance_precheck(state)
+    if gate is not None:
+        return gate
+    result = await dispatch_router_mode(state, mode=req.mode, when=req.when, timeout=req.timeout)
+    if result["status"] == "timeout":
+        return JSONResponse(result, status_code=504)
+    if result["status"] == "busy":
+        return JSONResponse(result, status_code=409)
     return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
 
 
