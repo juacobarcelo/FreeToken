@@ -307,6 +307,7 @@ class FrontendManager:
             "mode": msg.mode,
             "epoch": msg.epoch,
             "error": msg.error,
+            "profile": getattr(msg, "profile", None),
         }
         fut = self.rebuild_futures.pop(msg.request_id, None)
         if fut is not None and not fut.done():

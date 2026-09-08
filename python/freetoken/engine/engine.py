@@ -616,6 +616,12 @@ class Engine:
                 batch_size=config.max_running_req,
                 tensor_parallel_size=config.tp_info.size,
             )
+            if config.moe_router_profile:
+                from freetoken.moe.router_profile import ProfilingRouter
+
+                self._router_adapter = ProfilingRouter(
+                    self._router_adapter, num_layers=config.model_config.num_moe_layers
+                )
         # The adapter is built whenever a router config is given, even for mode "off", so a
         # later POST /v1/router/mode can attach it without reloading (set_router_mode).
         # Without a config there is nothing to switch to and the path is reported as "off".

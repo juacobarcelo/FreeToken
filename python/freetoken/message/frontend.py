@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from .utils import deserialize_type, serialize_type
 
@@ -69,6 +69,7 @@ class RouterModeReply(BaseFrontendMsg):
     mode: str = "off"
     epoch: int = 0
     error: str | None = None
+    profile: Dict[str, Any] | None = None
 
 
 @dataclass

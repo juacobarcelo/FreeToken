@@ -162,3 +162,14 @@ def test_router_mode_reply_roundtrip():
     assert (out.request_id, out.status, out.mode, out.epoch, out.error) == (
         "m4", "rejected", "active", 1, "graphs",
     )
+
+
+def test_router_mode_replies_carry_an_optional_profile():
+    from freetoken.message import RouterModeReply, RouterModeResultMsg
+
+    profile = {"schema_version": "1.0", "decode_host_over_gpu": 0.25, "totals": {"decode": {"calls": 2}}}
+    result = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(
+        RouterModeResultMsg(request_id="m5", status="ok", mode="off", epoch=2, profile=profile)))
+    assert result.profile == profile
+    reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(RouterModeReply(request_id="m5", status="ok")))
+    assert reply.profile is None

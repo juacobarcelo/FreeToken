@@ -118,6 +118,9 @@ class RouterModeResultMsg(BaseTokenizerMsg):
     mode: str = "off"  # the path now serving, whatever the status
     epoch: int = 0  # advances once per applied change; unchanged on no-op or refusal
     error: str | None = None
+    # Present only when the server runs --moe-router-profile: the rank-0 per-layer timing
+    # accumulated since the previous reply (freetoken.moe.router_profile).
+    profile: Dict[str, Any] | None = None
 
 
 @dataclass

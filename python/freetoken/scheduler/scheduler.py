@@ -688,9 +688,11 @@ class Scheduler(SchedulerIOMixin):
 
     def _reply_router_mode(self, request_id: str, status: str, error: str | None = None) -> None:
         from freetoken.moe.router_mode import current_router_mode
+        from freetoken.moe.router_profile import router_profile_snapshot
 
         # Every reply reports the path actually serving, whatever the status, so the API's
-        # /v1/stats view follows the scheduler rather than an assumed transition.
+        # /v1/stats view follows the scheduler rather than an assumed transition. With
+        # --moe-router-profile the reply also carries (and resets) the accumulated timing.
         self.send_result(
             [
                 RouterModeResultMsg(
@@ -699,6 +701,7 @@ class Scheduler(SchedulerIOMixin):
                     mode=current_router_mode(getattr(self.engine, "moe_offload_cache", None)),
                     epoch=getattr(self.engine, "router_mode_epoch", 0),
                     error=error,
+                    profile=router_profile_snapshot(getattr(self.engine, "_router_adapter", None)),
                 )
             ]
         )

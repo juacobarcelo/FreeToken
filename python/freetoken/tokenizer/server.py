@@ -210,6 +210,7 @@ def tokenize_worker(
                             mode=m.mode,
                             epoch=m.epoch,
                             error=m.error,
+                            profile=m.profile,
                         )
                     )
             n_control = sum(

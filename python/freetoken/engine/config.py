@@ -50,6 +50,9 @@ class EngineConfig:
     # keeps the stock path while holding the adapter so POST /v1/router/mode can attach
     # it on an idle engine without a reload (freetoken.moe.router_mode).
     moe_router_mode: str = "active"
+    # Diagnostic only: wrap the router adapter in a per-layer host/GPU timer that adds one
+    # stream synchronisation per layer (freetoken.moe.router_profile). Never for timed runs.
+    moe_router_profile: bool = False
     # Private experiment controls; no request-level stochastic seed API.
     router_diagnostic_config: str | None = None
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
