@@ -83,6 +83,35 @@ def test_adjust_config_rejects_incompatible_router_modes(overrides, message) -> 
         _adjust_config(config)
 
 
+def test_adjust_config_validates_the_router_mode_after_forcing_the_eager_path() -> None:
+    """The mode check runs on the adjusted configuration, not the requested one.
+
+    A router config always lands on the eager path inside ``_adjust_config``; checking the
+    graph settings before that adjustment rejected a configuration the function was about to
+    make legal (it did, until this test). What the check must still catch is the mode itself.
+    """
+    from freetoken.engine.engine import _adjust_config
+
+    # Graphs requested and a router config present: adjusted to eager, then accepted.
+    for mode in ("off", "planning-only", "active"):
+        config = _router_config(moe_router_mode=mode)
+        _adjust_config(config)
+        assert config.cuda_graph_max_bs == 0 and config.cuda_graph_bs == []
+
+    with pytest.raises(ValueError, match="moe_router_mode must be"):
+        _adjust_config(_router_config(moe_router_mode="sometimes"))
+
+    # planning-only asks for plans that are never applied: without a configuration to plan
+    # with it is meaningless and refused. "active" is the default value of the flag, so a
+    # plain run without a router configuration keeps the stock path instead of failing.
+    with pytest.raises(ValueError, match="planning-only requires"):
+        _adjust_config(_router_config(moe_router_config=None, moe_router_mode="planning-only"))
+    for mode in ("off", "active"):
+        stock = _router_config(moe_router_config=None, moe_router_mode=mode)
+        _adjust_config(stock)
+        assert stock.cuda_graph_max_bs == 16 and stock.cuda_graph_bs == [1, 2, 4, 8, 16]
+
+
 def test_adjust_config_rejects_router_for_non_gpt_oss() -> None:
     from freetoken.engine.engine import _adjust_config
 

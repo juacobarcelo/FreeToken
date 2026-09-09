@@ -1213,14 +1213,6 @@ def _adjust_config(config: EngineConfig):
         instrumentation_dir,
         instrumentation_run_id,
     )
-    from freetoken.moe.router_mode import validate_router_mode
-
-    validate_router_mode(
-        getattr(config, "moe_router_mode", "active"),
-        router_config=config.moe_router_config,
-        cuda_graph_bs=config.cuda_graph_bs,
-        cuda_graph_max_bs=config.cuda_graph_max_bs,
-    )
     if config.moe_router_config and (
         not is_moe or getattr(model_config, "model_type", None) != "gpt_oss"
     ):
@@ -1458,6 +1450,18 @@ def _adjust_config(config: EngineConfig):
             "InferenceSystemPlanner Alternative A enabled; CUDA graphs are disabled "
             "for causal host decisions"
         )
+    # After the adjustment above, not before it: a router config always lands on the eager
+    # path here, so validating the requested mode earlier would reject a configuration this
+    # function is about to make legal. What remains to check is the mode itself -- an unknown
+    # name, or planning-only/active without a router config to plan with.
+    from freetoken.moe.router_mode import validate_router_mode
+
+    validate_router_mode(
+        getattr(config, "moe_router_mode", "active"),
+        router_config=config.moe_router_config,
+        cuda_graph_bs=config.cuda_graph_bs,
+        cuda_graph_max_bs=config.cuda_graph_max_bs,
+    )
 
     if is_moe and config.moe_backend == "fused":
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The
